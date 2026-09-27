@@ -32,6 +32,7 @@ from .models import (
     RegisterRequest,
 )
 from .store import LocalStore
+from .persistent_store import PersistentStore
 
 _HTTP_STATUS = {
     ValidationError.code: 400,
@@ -96,9 +97,24 @@ def _snapshot_dict(s) -> dict:
     }
 
 
-def create_app(catalog: MetadataCatalog | None = None) -> FastAPI:
-    """构造 FastAPI 应用，可注入自定义 catalog（便于测试）。"""
-    catalog = catalog or MetadataCatalog(LocalStore())
+def create_app(
+    catalog: MetadataCatalog | None = None,
+    *,
+    store: LocalStore | PersistentStore | None = None,
+    repo_dir: str | None = None,
+) -> FastAPI:
+    """构造 FastAPI 应用。
+
+    :param catalog: 直接注入 catalog（优先级最高，便于测试）。
+    :param store: 注入存储实现；为 None 且 ``repo_dir`` 给定时使用
+        :class:`PersistentStore`（落盘、支持多进程），否则退回内存仓库。
+    :param repo_dir: 本地仓库目录；多个服务进程/实例指向同一目录即共享
+        同一份数据，写入在进程间串行化，结论与单进程一致。
+    """
+    if catalog is None:
+        if store is None:
+            store = PersistentStore(repo_dir) if repo_dir is not None else LocalStore()
+        catalog = MetadataCatalog(store)
     app = FastAPI(
         title="本地元数据目录与血缘服务",
         version="0.1.0",

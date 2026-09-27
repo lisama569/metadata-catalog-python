@@ -38,12 +38,16 @@
 
 ### 1.3 并发一致性
 
-- 所有写操作在存储层同一把可重入锁内完成"**检查 + 写入**"，无 TOCTOU 窗口。
+- 内存实现（`LocalStore`）中所有写操作在同一把可重入锁内完成"**检查 + 写入**"，无 TOCTOU 窗口；
+  持久化实现（`PersistentStore`）中该临界区对应跨进程 `flock(LOCK_EX)`，
+  结论在**多个独立进程**下同样成立。
 - 并发用相同结构登记同一资产：恰好 1 个 `created`，其余全部 `re_registered_idempotent`，
   最终 `schema_version=1`。
 - 携带 `expected_schema_version` 时，若与当前版本不一致，返回
   `409 version_conflict`（含 `expected_version` / `actual_version`），**不写入**。
   调用方应重新读取最新结构后重试。
+- 持久化、重启恢复、多进程保证、数据文件兼容范围详见
+  [`persistence.md`](persistence.md)。
 
 ### 1.4 输入校验（`400 validation_error`）
 
@@ -161,6 +165,11 @@ uv run python -m pytest -s
 | `tests/test_lineage.py` | 接受/重复边/缺失资产/自环/间接成环、批量顺序语义、直接与传递影响范围 |
 | `tests/test_governance.py` | owner/标签增删替换、幂等无变化、乐观锁冲突、冲突后重试、**多线程并发**治理写入、并发同结构登记幂等、并发血缘重复边 |
 | `tests/test_api.py` | HTTP 状态码与错误 `code` 映射、批量接口、404/409/422 |
+| `tests/test_persistence.py` | 重启恢复、被拒/中断不产生脏数据、半行裁剪、压缩代际切换、格式版本不兼容 |
+| `tests/test_multiprocess.py` | **真实多进程**并发登记/演进/治理/血缘的最终一致性、过期版本必冲突、跨进程可见 |
+| `tests/test_scale.py` | 上万资产与血缘规模下读写/影响范围/重启加载性能 |
+
+持久化与多进程语义、恢复边界、数据文件兼容性见 [`persistence.md`](persistence.md)。
 
 每个用例都通过日志打印**输入**与**判定依据**，例如：
 

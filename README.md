@@ -1,13 +1,17 @@
 # 本地元数据目录与血缘服务
 
 一套可在本地直接运行的**元数据目录（Metadata Catalog）与数据血缘（Lineage）服务**。
-用进程内的线程安全存储模拟元数据仓库，聚焦三件事：
+数据默认**落地在本地磁盘目录**、服务重启后继续可用，并支持**多个进程**指向
+同一仓库并发读写；也可退回纯内存模式。聚焦三件事：
 
 1. 数据资产及其字段结构的**登记、幂等重复上报与结构演进**；
 2. 上下游**血缘关系写入、成环检测与直接/传递影响范围查询**；
 3. 标签与负责人的**乐观并发更新**，并发或过期版本写入不丢更新、不错乱。
 
-> 存储为内存模拟（进程重启即清空），不依赖外部数据库，便于本地验证与单测。
+> 默认仓库目录为 `./data`（可用环境变量 `METADATA_CATALOG_REPO` 覆盖）。
+> 写入以追加日志 + `fsync` 提交、按快照压缩，进程崩溃只会丢掉"尚未提交的
+> 半截写入"，已提交数据可完整恢复。持久化/多进程的完整语义与边界见
+> [`docs/persistence.md`](docs/persistence.md)。
 
 ## 快速开始
 
@@ -29,7 +33,12 @@ uv run python -m pytest -s
 
 - `-s` 可看到每个用例打印的**输入**与**判定依据**日志（`register 输入 ...` / `register 判定 ...` 等）。
 - 测试覆盖：重复上报幂等、结构不兼容（类型变更/收紧非空/重命名改类型/资产种类变更）、
-  血缘成环/重复边/缺失资产/传递影响、标签与负责人的乐观锁与多线程并发写入。
+  血缘成环/重复边/缺失资产/传递影响、标签与负责人的乐观锁与多线程并发写入；
+  **重启恢复、写入失败/中断不留脏数据、真实多进程并发的最终一致性、上万规模性能**。
+
+多进程共享同一仓库：多个 `uv run fastapi run main.py`（或脚本里
+`PersistentStore(同一目录)`）会自动通过文件锁串行化写入，结论与单进程一致；
+带过期版本的并发写入只有一方成功，其余收到明确可区分的 `409` 冲突。
 
 ## HTTP 接口一览
 
@@ -82,14 +91,16 @@ curl -s -X POST localhost:8000/assets/register -H 'content-type: application/jso
 
 ```
 metadata_catalog/
-  errors.py    # 可区分的领域错误（code + 详情，如 reasons / expected / actual）
-  models.py    # 资产/字段/血缘/治理等数据模型
-  store.py     # 线程安全的本地内存仓库（RLock + 事务临界区）
-  catalog.py   # 领域服务：登记演进、血缘校验、治理乐观锁（全部业务规则在此）
-  api.py       # FastAPI 适配层与错误码映射
-main.py        # 服务入口
-tests/         # 登记/血缘/并发/HTTP 四组测试，打印输入与判定依据
-docs/          # 语义与规则的详细说明
+  errors.py            # 可区分的领域错误（code + 详情，如 reasons / expected / actual）
+  models.py            # 资产/字段/血缘/治理等数据模型
+  store.py             # 线程安全的本地内存仓库（RLock + 事务临界区）
+  persistent_store.py  # 落盘仓库：追加日志+快照压缩+fsync 提交，flock 支持多进程
+  catalog.py           # 领域服务：登记演进、血缘校验、治理乐观锁（全部业务规则在此）
+  api.py               # FastAPI 适配层与错误码映射（可用 repo_dir 选择持久化仓库）
+main.py                # 服务入口（默认仓库 ./data）
+tests/                 # 登记/血缘/并发/HTTP + 持久化恢复/真实多进程/规模化 测试
+docs/                  # 语义规则(semantics) 与持久化并发语义(persistence)
 ```
 
-详细语义见 [`docs/semantics.md`](docs/semantics.md)。
+详细业务语义见 [`docs/semantics.md`](docs/semantics.md)，
+持久化、恢复与多进程保证见 [`docs/persistence.md`](docs/persistence.md)。

@@ -103,3 +103,47 @@ def test_get_missing_asset_404(client):
     r = client.get("/assets/ghost")
     logger.info("判定依据: status=%s code=%s", r.status_code, r.json()["code"])
     assert r.status_code == 404 and r.json()["code"] == "asset_not_found"
+
+
+def test_api_over_persistent_repo_survives_recreate(tmp_path):
+    """HTTP 层接入 PersistentStore：写入后用同目录重建 app，数据依旧可读。"""
+    from fastapi.testclient import TestClient
+
+    from metadata_catalog.api import create_app
+
+    repo = str(tmp_path)
+    app = create_app(repo_dir=repo)
+    client = TestClient(app)
+    r = client.post(
+        "/assets/register",
+        json={
+            "name": "orders",
+            "asset_type": "table",
+            "fields": [{"name": "id", "field_type": "long", "nullable": False}],
+        },
+    )
+    assert r.status_code == 200 and r.json()["action"] == "created"
+    r = client.put(
+        "/assets/orders/governance",
+        json={"expected_governance_version": 0, "owner": "alice", "add_tags": ["pii"]},
+    )
+    assert r.status_code == 200
+
+    # 模拟服务重启：同目录重新构造应用。
+    app2 = create_app(repo_dir=repo)
+    client2 = TestClient(app2)
+    r = client2.get("/assets/orders")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["schema_version"] == 1
+    assert body["owner"] == "alice"
+    assert body["tags"] == ["pii"]
+
+    # 过期版本经 HTTP 仍然是明确的 409 冲突，而非静默成功。
+    r = client2.put(
+        "/assets/orders/governance",
+        json={"expected_governance_version": 0, "owner": "bob"},
+    )
+    assert r.status_code == 409
+    assert r.json()["code"] == "version_conflict"
+    assert r.json()["actual_version"] == 1

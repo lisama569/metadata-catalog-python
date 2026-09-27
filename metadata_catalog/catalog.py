@@ -144,11 +144,9 @@ def _find_cycle_if_added(
     """若新增 ``upstream -> downstream`` 会成环，返回环路径，否则 None。
 
     成环条件等价于：当前图中已存在从 ``downstream`` 到 ``upstream`` 的路径。
+    邻接关系通过存储层增量维护的 ``downstream_of`` 索引按需展开（O(可达规模)），
+    而不是每条边都从全量边重建整张图。
     """
-    forward: dict[str, list[str]] = {}
-    for e in store.list_edges():
-        forward.setdefault(e.upstream, []).append(e.downstream)
-
     # DFS 找 downstream -> ... -> upstream 的路径
     stack: list[tuple[str, list[str]]] = [(downstream, [downstream])]
     visited: set[str] = {downstream}
@@ -156,7 +154,7 @@ def _find_cycle_if_added(
         node, path = stack.pop()
         if node == upstream:
             return path + [downstream]
-        for nxt in forward.get(node, []):
+        for nxt in store.downstream_of(node):
             if nxt not in visited:
                 visited.add(nxt)
                 stack.append((nxt, path + [nxt]))
@@ -481,7 +479,7 @@ class MetadataCatalog:
         结果排序以保证结论可复现；资产不存在时抛 AssetNotFoundError。
         """
         logger.info("impact 输入: asset=%s", asset)
-        with self.store.transaction():
+        with self.store.read_transaction():
             if self.store.get_asset(asset) is None:
                 logger.info("impact 判定: not_found asset=%s", asset)
                 raise AssetNotFoundError(f"资产不存在: {asset}")

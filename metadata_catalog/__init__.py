@@ -19,11 +19,14 @@ from .models import (
     LineageEdge,
     RegisterRequest,
 )
+from .persistent_store import PersistentStore, StoreCorruptionError
 from .store import LocalStore
 
 __all__ = [
     "MetadataCatalog",
     "LocalStore",
+    "PersistentStore",
+    "StoreCorruptionError",
     "CatalogError",
     "ValidationError",
     "IncompatibleSchemaError",

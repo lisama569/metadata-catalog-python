@@ -21,10 +21,22 @@ class LocalStore:
         self._lock = threading.RLock()
         self._assets: dict[str, AssetSnapshot] = {}
         self._edges: dict[tuple[str, str], LineageEdge] = {}
+        # 增量维护的正向邻接索引，供成环判定使用（避免每条边 O(E) 重建）。
+        self._forward: dict[str, set[str]] = {}
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
         """进入全局临界区；可重入，服务层在其中完成检查与写入。"""
+        with self._lock:
+            yield
+
+    @contextmanager
+    def read_transaction(self) -> Iterator[None]:
+        """只读临界区。
+
+        内存实现中读写共用同一把可重入锁；持久化实现里它对应跨进程
+        ``LOCK_SH`` 共享锁，多个读者可并发、仅与写者互斥。
+        """
         with self._lock:
             yield
 
@@ -48,11 +60,24 @@ class LocalStore:
 
     def add_edge(self, edge: LineageEdge) -> None:
         with self._lock:
+            if edge.key() not in self._edges:
+                self._forward.setdefault(edge.upstream, set()).add(edge.downstream)
             self._edges[edge.key()] = edge
 
     def remove_edge(self, upstream: str, downstream: str) -> None:
         with self._lock:
-            self._edges.pop((upstream, downstream), None)
+            existed = self._edges.pop((upstream, downstream), None)
+            if existed is not None:
+                self._forward.get(upstream, set()).discard(downstream)
+
+    def downstream_of(self, upstream: str) -> list[str]:
+        """返回该节点当前的直接下游列表（增量正向索引，O(度)）。
+
+        必须在 ``transaction()`` / ``read_transaction()`` 临界区内调用，
+        供领域层做新增边的成环判定。
+        """
+        with self._lock:
+            return sorted(self._forward.get(upstream, set()))
 
     def list_edges(self) -> list[LineageEdge]:
         with self._lock:
@@ -63,3 +88,4 @@ class LocalStore:
         with self._lock:
             self._assets.clear()
             self._edges.clear()
+            self._forward.clear()
