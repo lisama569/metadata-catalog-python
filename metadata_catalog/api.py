@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import os
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -19,6 +21,7 @@ from .errors import (
     AssetNotFoundError,
     CatalogError,
     IncompatibleSchemaError,
+    StorageError,
     ValidationError,
     VersionConflictError,
 )
@@ -31,13 +34,18 @@ from .models import (
     LineageEdge,
     RegisterRequest,
 )
+from .persistence import PersistentStore
 from .store import LocalStore
+
+#: 服务默认使用的本地仓库目录；可用环境变量覆盖。
+DEFAULT_REPO_DIR = os.environ.get("METADATA_CATALOG_REPO", ".metadata_catalog_repo")
 
 _HTTP_STATUS = {
     ValidationError.code: 400,
     IncompatibleSchemaError.code: 422,
     AssetNotFoundError.code: 404,
     VersionConflictError.code: 409,
+    # StorageError 子类统一在异常处理器中映射为 500。
 }
 
 
@@ -96,9 +104,26 @@ def _snapshot_dict(s) -> dict:
     }
 
 
-def create_app(catalog: MetadataCatalog | None = None) -> FastAPI:
-    """构造 FastAPI 应用，可注入自定义 catalog（便于测试）。"""
-    catalog = catalog or MetadataCatalog(LocalStore())
+def create_app(
+    catalog: MetadataCatalog | None = None,
+    *,
+    store=None,
+    repo_dir: str | os.PathLike[str] | None = None,
+) -> FastAPI:
+    """构造 FastAPI 应用。
+
+    存储解析顺序：
+
+    1. 显式传入的 ``catalog``（测试最常用）；
+    2. 显式传入的 ``store``（如 ``LocalStore()`` 或 ``PersistentStore(path)``）；
+    3. 默认在本地 ``repo_dir``（环境变量 ``METADATA_CATALOG_REPO``，
+       默认 ``.metadata_catalog_repo``）上打开持久化仓库——服务重启后
+       数据仍在，多个进程可同时打开同一目录。
+    """
+    if catalog is None:
+        if store is None:
+            store = PersistentStore(repo_dir or DEFAULT_REPO_DIR)
+        catalog = MetadataCatalog(store)
     app = FastAPI(
         title="本地元数据目录与血缘服务",
         version="0.1.0",
@@ -112,9 +137,13 @@ def create_app(catalog: MetadataCatalog | None = None) -> FastAPI:
         if isinstance(exc, VersionConflictError):
             body["expected_version"] = exc.expected_version
             body["actual_version"] = exc.actual_version
-        return JSONResponse(
-            status_code=_HTTP_STATUS.get(exc.code, 400), content=body
-        )
+        # StorageError 及其子类（storage_corruption / unsupported_storage_format）
+        # 都视为仓库侧故障，统一 500，与业务裁决类错误明确区分。
+        if isinstance(exc, StorageError):
+            status = 500
+        else:
+            status = _HTTP_STATUS.get(exc.code, 400)
+        return JSONResponse(status_code=status, content=body)
 
     @app.get("/")
     def read_root():

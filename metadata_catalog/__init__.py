@@ -7,6 +7,9 @@ from .errors import (
     DuplicateEdgeError,
     IncompatibleSchemaError,
     LineageCycleError,
+    StorageCorruptionError,
+    StorageError,
+    UnsupportedStorageFormatError,
     ValidationError,
     VersionConflictError,
 )
@@ -19,11 +22,13 @@ from .models import (
     LineageEdge,
     RegisterRequest,
 )
+from .persistence import PersistentStore
 from .store import LocalStore
 
 __all__ = [
     "MetadataCatalog",
     "LocalStore",
+    "PersistentStore",
     "CatalogError",
     "ValidationError",
     "IncompatibleSchemaError",
@@ -31,6 +36,9 @@ __all__ = [
     "LineageCycleError",
     "DuplicateEdgeError",
     "VersionConflictError",
+    "StorageError",
+    "StorageCorruptionError",
+    "UnsupportedStorageFormatError",
     "AssetSpec",
     "AssetType",
     "FieldSpec",

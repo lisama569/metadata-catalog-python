@@ -28,6 +28,16 @@ class LocalStore:
         with self._lock:
             yield
 
+    @contextmanager
+    def read_transaction(self) -> Iterator[None]:
+        """读临界区。
+
+        内存仓库没有进程间可见性问题，读直接复用同一把可重入锁；
+        持久化仓库则在此处放宽为跨进程共享锁以允许并发读者。
+        """
+        with self._lock:
+            yield
+
     # ---- 资产 ----
     def get_asset(self, name: str) -> AssetSnapshot | None:
         with self._lock:

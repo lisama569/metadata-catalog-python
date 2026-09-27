@@ -72,3 +72,30 @@ class VersionConflictError(CatalogError):
         super().__init__(message)
         self.expected_version = expected
         self.actual_version = actual
+
+
+class StorageError(CatalogError):
+    """本地持久化仓库自身的故障（IO 错误、数据文件损坏、格式不受支持等）。
+
+    与"业务上被拒绝"（``IncompatibleSchemaError`` / ``VersionConflictError``）
+    严格区分：存储故障意味着仓库状态可能不可用，而不是一次有据可依的裁决。
+    """
+
+    code = "storage_error"
+
+
+class StorageCorruptionError(StorageError):
+    """仓库中的数据文件无法解析，磁盘内容已损坏。"""
+
+    code = "storage_corruption"
+
+
+class UnsupportedStorageFormatError(StorageError):
+    """数据文件来自更新/更旧的仓库格式版本，当前进程无法安全读写。"""
+
+    code = "unsupported_storage_format"
+
+    def __init__(self, message: str, *, version: int, supported: int) -> None:
+        super().__init__(message)
+        self.format_version = version
+        self.supported_version = supported

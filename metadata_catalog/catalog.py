@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Protocol
 
 from .errors import (
     AssetNotFoundError,
@@ -34,9 +35,30 @@ from .models import (
     RegisterRequest,
     now_ts,
 )
-from .store import LocalStore
 
 logger = logging.getLogger("metadata_catalog")
+
+
+class CatalogStore(Protocol):
+    """存储层协议：内存仓库与本地持久化仓库共同满足。"""
+
+    def transaction(self): ...
+
+    def read_transaction(self): ...
+
+    def get_asset(self, name: str) -> AssetSnapshot | None: ...
+
+    def put_asset(self, snapshot: AssetSnapshot) -> None: ...
+
+    def list_assets(self) -> list[AssetSnapshot]: ...
+
+    def has_edge(self, upstream: str, downstream: str) -> bool: ...
+
+    def add_edge(self, edge: LineageEdge) -> None: ...
+
+    def remove_edge(self, upstream: str, downstream: str) -> None: ...
+
+    def list_edges(self) -> list[LineageEdge]: ...
 
 
 def _validate_spec(spec: AssetSpec) -> None:
@@ -139,7 +161,7 @@ def _diff_fields(
 
 
 def _find_cycle_if_added(
-    store: LocalStore, upstream: str, downstream: str
+    store: CatalogStore, upstream: str, downstream: str
 ) -> list[str] | None:
     """若新增 ``upstream -> downstream`` 会成环，返回环路径，否则 None。
 
@@ -182,7 +204,10 @@ def _transitive(start: str, adjacency: dict[str, list[str]]) -> set[str]:
 class MetadataCatalog:
     """元数据目录服务。"""
 
-    def __init__(self, store: LocalStore | None = None) -> None:
+    def __init__(self, store: CatalogStore | None = None) -> None:
+        # 默认仍是进程内内存仓库；需要重启保留/多进程共享时注入 PersistentStore。
+        from .store import LocalStore
+
         self.store = store or LocalStore()
 
     # ---- 资产登记与结构演进 ----
@@ -356,14 +381,16 @@ class MetadataCatalog:
             )
 
     def get_asset(self, name: str) -> AssetSnapshot:
-        snapshot = self.store.get_asset(name)
+        with self.store.read_transaction():
+            snapshot = self.store.get_asset(name)
         if snapshot is None:
             logger.info("get_asset 判定: not_found asset=%s", name)
             raise AssetNotFoundError(f"资产不存在: {name}")
         return snapshot
 
     def list_assets(self) -> list[AssetSnapshot]:
-        return self.store.list_assets()
+        with self.store.read_transaction():
+            return self.store.list_assets()
 
     # ---- 血缘 ----
     def _check_and_add_edge(self, edge: LineageEdge) -> EdgeCheckResult:
@@ -481,7 +508,7 @@ class MetadataCatalog:
         结果排序以保证结论可复现；资产不存在时抛 AssetNotFoundError。
         """
         logger.info("impact 输入: asset=%s", asset)
-        with self.store.transaction():
+        with self.store.read_transaction():
             if self.store.get_asset(asset) is None:
                 logger.info("impact 判定: not_found asset=%s", asset)
                 raise AssetNotFoundError(f"资产不存在: {asset}")

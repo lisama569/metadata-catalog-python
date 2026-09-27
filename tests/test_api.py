@@ -19,6 +19,17 @@ def client() -> TestClient:
     return TestClient(create_app(MetadataCatalog(LocalStore())))
 
 
+@pytest.fixture
+def persistent_client(tmp_path):
+    """指向临时磁盘仓库的 app；测试可重新 create_app 模拟服务重启。"""
+    repo = str(tmp_path / "repo")
+
+    def _make():
+        return TestClient(create_app(repo_dir=repo))
+
+    return _make
+
+
 def _register(client, name, fields=None, **kw):
     return client.post(
         "/assets/register",
@@ -103,3 +114,45 @@ def test_get_missing_asset_404(client):
     r = client.get("/assets/ghost")
     logger.info("判定依据: status=%s code=%s", r.status_code, r.json()["code"])
     assert r.status_code == 404 and r.json()["code"] == "asset_not_found"
+
+
+def test_http_data_survives_app_restart(persistent_client):
+    """默认持久化仓库：写入后重新构造 app（等价于服务重启）数据完整。"""
+    c1 = persistent_client()
+    fields = [{"name": "id", "field_type": "long", "nullable": False}]
+    assert _register(c1, "orders", fields).json()["action"] == "created"
+    ok = c1.put(
+        "/assets/orders/governance",
+        json={"expected_governance_version": 0, "owner": "alice",
+              "add_tags": ["pii"]},
+    )
+    assert ok.status_code == 200
+
+    c2 = persistent_client()
+    logger.info("用例输入: 重新构造 app 后 GET /assets/orders")
+    body = c2.get("/assets/orders").json()
+    logger.info("判定依据: sv=%s gv=%s owner=%s tags=%s",
+                body["schema_version"], body["governance_version"],
+                body["owner"], body["tags"])
+    assert body["schema_version"] == 1
+    assert body["governance_version"] == 1
+    assert body["owner"] == "alice" and body["tags"] == ["pii"]
+    assert c2.get("/assets/ghost").status_code == 404
+
+
+def test_storage_error_maps_to_500(tmp_path, monkeypatch):
+    """数据文件损坏时读接口给出 500 storage_corruption，而不是伪装成不存在。"""
+    repo = tmp_path / "repo"
+    c1 = TestClient(create_app(repo_dir=str(repo)))
+    _register(c1, "orders", [{"name": "id", "field_type": "long"}])
+
+    # 找到资产文件并破坏其内容
+    files = list((repo / "assets").glob("*.json"))
+    assert len(files) == 1
+    files[0].write_text("{ broken json", encoding="utf-8")
+
+    c2 = TestClient(create_app(repo_dir=str(repo)))
+    r = c2.get("/assets/orders")
+    logger.info("判定依据: 损坏文件 status=%s body=%s", r.status_code, r.json())
+    assert r.status_code == 500
+    assert r.json()["code"] == "storage_corruption"
