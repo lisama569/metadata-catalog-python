@@ -36,11 +36,14 @@ uv run python -m pytest -s
 
 - `-s` 可看到每个用例打印的**输入**与**判定依据**日志（`register 输入 ...` / `register 判定 ...` 等）。
 - 测试覆盖：重复上报幂等、结构不兼容（类型变更/收紧非空/重命名改类型/资产种类变更）、
-  血缘成环/重复边/缺失资产/传递影响、标签与负责人的乐观锁与多线程并发写入；
-  以及持久化专项：**重启完整恢复、写入失败/被 kill 不留脏数据、真实多进程并发
-  最终一致、上万规模读写耗时护栏**（详见 docs 第 6 节）。
-- 持久化专项用例（真实多进程、上万数据规模）数量少但偏重，可用
-  `uv run python -m pytest tests/test_persistence.py tests/test_multiprocess.py`
+  血缘成环/重复边/缺失资产/传递影响、标签与负责人的乐观锁；
+  **同进程真实线程并发**（持续并发读+突发并发写、同版本结构/治理竞争、
+  并发登记与重复血缘去重）、**真实 HTTP 并发**（uvicorn + 多 httpx 客户端，
+  读不超时、写恰一成功）、**失败写入回滚**（rename 前抛错后同进程读、
+  无关写、重启都不可见）；以及**真实多进程并发与最终一致**（spawn 多进程、
+  被杀写入不留脏数据）、重启完整恢复、上万规模读写耗时护栏（详见 docs 第 6 节）。
+- 并发与故障专项用例可用
+  `uv run python -m pytest tests/test_concurrency.py tests/test_http_concurrency.py tests/test_mp_failure.py tests/test_multiprocess.py tests/test_persistence.py`
   只跑这部分。
 
 ## HTTP 接口一览
@@ -63,11 +66,18 @@ uv run python -m pytest -s
 
 | HTTP | code | 含义 |
 | --- | --- | --- |
-| 400 | `validation_error` | 输入不合法（空名、重复字段、rename 声明矛盾等） |
+| 400 | `validation_error` | 输入不合法（空名、重复字段、rename 声明矛盾、请求体字段非法等） |
 | 404 | `asset_not_found` | 引用的资产不存在 |
-| 409 | `version_conflict` | 携带过期版本写入（结构或治理），冲突可区分 |
+| 409 | `version_conflict` | 携带过期版本写入（结构或治理），冲突可区分（含 `expected_version` / `actual_version`） |
 | 422 | `incompatible_schema` | 结构演进不兼容，被拒绝且**不写入** |
+| 500 | `storage_error` | 本地仓库写入/读取中途的 IO 故障（如磁盘写失败）。失败写**不生效**，仓库停留在写入前完整状态；它同时是 `OSError` 子类，调用方两种 except 都能接住 |
 | 500 | `storage_corruption` / `unsupported_storage_format` | 本地仓库数据文件损坏 / 格式版本不受支持（存储故障，区别于业务裁决） |
+| 500 | `internal_error` | 理论上不应出现的未归类服务端异常的最后防线，响应仍带 `code`（不会是裸 500） |
+
+业务裁决（400/404/409/422）与存储故障（500）严格分离：冲突和失败是两类
+不同结果——**冲突**意味着调用方基于了过期版本，读新版本后重试即可收敛；
+**失败**意味着这一次提交根本没有生效，仓库里只能看到写入前的完整状态，
+不存在"半更新"需要回滚或修补。
 
 血缘写接口对"重复边/成环/缺失资产"返回 200 且在响应体中用
 `accepted=false` + `code` **明确标记**（业务上可预期、需要逐条处理），而非服务端 5xx。
@@ -96,14 +106,18 @@ curl -s -X POST localhost:8000/assets/register -H 'content-type: application/jso
 ```
 metadata_catalog/
   errors.py       # 可区分的领域错误（code + 详情，如 reasons / expected / actual；
-                  #   含 storage_corruption / unsupported_storage_format）
-  models.py       # 资产/字段/血缘/治理等数据模型
-  store.py        # 线程安全的进程内内存仓库（RLock，临时/测试用）
-  persistence.py  # 本地磁盘持久化仓库：原子写 + flock 跨进程锁 + 增量缓存
-  catalog.py      # 领域服务：登记演进、血缘校验、治理乐观锁（全部业务规则在此）
-  api.py          # FastAPI 适配层与错误码映射（默认打开本地持久化仓库）
+                  #   StorageError 同时是 OSError 子类，含 storage_error/
+                  #   storage_corruption / unsupported_storage_format）
+  models.py       # 资产/字段/血缘/治理等数据模型（快照写时复制 copy/with_updates）
+  locking.py      # 每线程可重入的多读单写事务门（写者优先），供两种仓库共用
+  store.py        # 线程安全的进程内内存仓库（读共享/写排他，读出的快照为副本）
+  persistence.py  # 本地磁盘持久化仓库：原子写 + flock 跨进程锁（引用计数）+ 增量缓存
+  catalog.py      # 领域服务：登记演进、血缘校验、治理乐观锁（全部业务规则在此，
+                  #   任何写入都"先构造完整新快照、落盘成功后才生效"）
+  api.py          # FastAPI 适配层与错误码映射（默认打开本地持久化仓库，
+                  #   含未归类异常 -> internal_error 的最后防线）
 main.py           # 服务入口
-tests/            # 登记/血缘/并发/HTTP + 持久化/真实多进程/规模 测试
+tests/            # 登记/血缘/治理/HTTP + 并发/失败回滚/真实多进程/规模 测试
 docs/             # 语义、持久化与并发保证的详细说明
 ```
 

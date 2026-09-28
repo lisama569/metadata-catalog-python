@@ -243,3 +243,60 @@ def test_concurrent_lineage_duplicate_edge(catalog):
     assert codes.count("accepted") == 1
     assert codes.count("duplicate_edge") == thread_count - 1
     assert len(catalog.store.list_edges()) == 1
+
+
+def test_concurrent_schema_evolution_only_one_wins(catalog):
+    """同进程内 N 个线程基于同一 sv 并发演进：恰好 1 成功，其余可区分冲突。"""
+    _asset(catalog)
+    n = 16
+    logger.info("用例输入: %d 线程同时基于 sv=1 加不同字段", n)
+    results: list[tuple[str, int]] = []
+    barrier = threading.Barrier(n)
+    lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        barrier.wait()
+        try:
+            out = catalog.register(
+                RegisterRequest(
+                    spec=AssetSpec(
+                        name="t1",
+                        asset_type=AssetType.TABLE,
+                        fields=[
+                            FieldSpec("id", FieldType.LONG, False),
+                            FieldSpec(f"col{i}", FieldType.STRING),
+                        ],
+                    ),
+                    expected_schema_version=1,
+                )
+            )
+            with lock:
+                results.append((out.action, out.schema_version))
+        except VersionConflictError as exc:
+            with lock:
+                results.append(("conflict", exc.actual_version))
+
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        list(pool.map(worker, range(n)))
+    evolved = [r for r in results if r[0] == "evolved"]
+    conflicts = [r for r in results if r[0] == "conflict"]
+    logger.info("判定依据: evolved=%d conflict=%d", len(evolved), len(conflicts))
+    assert len(evolved) == 1
+    assert len(conflicts) == n - 1
+    assert {r[1] for r in conflicts} == {2}
+    snap = catalog.get_asset("t1")
+    assert snap.schema_version == 2
+    assert len(snap.fields) == 2  # 无字段拼花
+
+
+def test_returned_snapshots_are_independent_from_store(catalog):
+    """调用方拿到的快照可自由修改，不会污染仓库内状态。"""
+    _asset(catalog)
+    leaked = catalog.get_asset("t1")
+    leaked.schema_version = 99
+    leaked.tags.add("ghost")
+    leaked.fields["ghost"] = object()  # type: ignore[assignment]
+    fresh = catalog.get_asset("t1")
+    assert fresh.schema_version == 1
+    assert fresh.tags == set()
+    assert set(fresh.fields) == {"id"}

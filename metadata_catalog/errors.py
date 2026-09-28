@@ -74,14 +74,21 @@ class VersionConflictError(CatalogError):
         self.actual_version = actual
 
 
-class StorageError(CatalogError):
+class StorageError(CatalogError, OSError):
     """本地持久化仓库自身的故障（IO 错误、数据文件损坏、格式不受支持等）。
 
     与"业务上被拒绝"（``IncompatibleSchemaError`` / ``VersionConflictError``）
     严格区分：存储故障意味着仓库状态可能不可用，而不是一次有据可依的裁决。
+
+    同时继承 :class:`OSError`：磁盘读写中途失败本质上就是 IO 故障，调用方
+    用 ``except OSError``（含测试里的故障注入）或 ``except StorageError``
+    都能捕获，而 HTTP 层仍可按 ``code`` 归类为明确的 500。
     """
 
     code = "storage_error"
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message, code=code)
 
 
 class StorageCorruptionError(StorageError):

@@ -177,6 +177,7 @@ def _find_cycle_if_added(
     while stack:
         node, path = stack.pop()
         if node == upstream:
+            # 闭合环：downstream -> ... -> upstream -> downstream
             return path + [downstream]
         for nxt in forward.get(node, []):
             if nxt not in visited:
@@ -236,6 +237,7 @@ class MetadataCatalog:
                     raise ValidationError(
                         f"资产 {spec.name} 尚未登记，不能携带重命名声明"
                     )
+                ts = now_ts()
                 snapshot = AssetSnapshot(
                     name=spec.name,
                     asset_type=spec.asset_type,
@@ -248,9 +250,11 @@ class MetadataCatalog:
                     owner=None,
                     tags=set(),
                     governance_version=0,
-                    created_at=now_ts(),
-                    updated_at=now_ts(),
+                    created_at=ts,
+                    updated_at=ts,
                 )
+                # 先落盘/入仓成功，再向调用方返回 created；失败时仓库里
+                # 仍然像"从未登记"。
                 self.store.put_asset(snapshot)
                 changed = {f.name: "added" for f in spec.fields}
                 logger.info(
@@ -326,9 +330,13 @@ class MetadataCatalog:
             }
             if not changes and structural == old_structural:
                 # 描述等非结构信息允许刷新，但结构版本不动，结论幂等。
-                existing.description = spec.description
-                existing.updated_at = now_ts()
-                self.store.put_asset(existing)
+                # 只有描述真的变化时才写盘，避免幂等上报产生无谓的落盘抖动。
+                if spec.description != existing.description:
+                    refreshed = existing.with_updates(
+                        description=spec.description,
+                        updated_at=now_ts(),
+                    )
+                    self.store.put_asset(refreshed)
                 logger.info(
                     "register 判定: idempotent asset=%s schema_version=%s",
                     spec.name,
@@ -342,7 +350,7 @@ class MetadataCatalog:
                     reason="结构与已登记版本完全一致，重复上报幂等，不产生新版本",
                 )
 
-            # ---- 兼容演进：构造下一个版本 ----
+            # ---- 兼容演进：构造下一个版本（写时复制，旧快照保持不动） ----
             next_version = existing.schema_version + 1
             rename_targets = {v: k for k, v in request.renames.items()}
             next_fields: dict[str, FieldRecord] = {}
@@ -361,11 +369,16 @@ class MetadataCatalog:
                         spec=f, since_version=next_version
                     )
 
-            existing.fields = next_fields
-            existing.schema_version = next_version
-            existing.description = spec.description
-            existing.updated_at = now_ts()
-            self.store.put_asset(existing)
+            # 关键：新状态是一份全新的快照对象。put_asset 若因磁盘故障失败，
+            # existing（仓库内与其他读者持有的对象）仍是完整的旧版本——
+            # 结构版本、字段内容、治理信息不会出现半更新。
+            updated = existing.with_updates(
+                fields=next_fields,
+                schema_version=next_version,
+                description=spec.description,
+                updated_at=now_ts(),
+            )
+            self.store.put_asset(updated)
             logger.info(
                 "register 判定: evolved asset=%s schema_version=%s changes=%s",
                 spec.name,
@@ -615,29 +628,40 @@ class MetadataCatalog:
             changed = owner_changed or tags_changed
 
             if changed:
-                snapshot.owner = new_owner
-                snapshot.tags = new_tags
-                snapshot.governance_version += 1
-                snapshot.updated_at = now_ts()
-                self.store.put_asset(snapshot)
-
-            result = GovernanceOutcome(
-                asset=update.asset,
-                governance_version=snapshot.governance_version,
-                owner=snapshot.owner,
-                tags=sorted(snapshot.tags),
-                changed=changed,
-                reason=(
-                    f"治理信息已更新，governance_version="
-                    f"{snapshot.governance_version}"
-                    if changed
-                    else "与当前治理信息一致，幂等写入，版本不变"
-                ),
-            )
+                # 写时复制：先在新对象上形成完整的下一状态，再一次性提交。
+                # put_asset 失败时 snapshot 仍是旧的完整版本，失败的治理
+                # 变更不会污染进程内缓存，更不会被后续无关写入带出。
+                updated = snapshot.with_updates(
+                    owner=new_owner,
+                    tags=new_tags,
+                    governance_version=snapshot.governance_version + 1,
+                    updated_at=now_ts(),
+                )
+                self.store.put_asset(updated)
+                result = GovernanceOutcome(
+                    asset=update.asset,
+                    governance_version=updated.governance_version,
+                    owner=updated.owner,
+                    tags=sorted(updated.tags),
+                    changed=True,
+                    reason=(
+                        "治理信息已更新，governance_version="
+                        f"{updated.governance_version}"
+                    ),
+                )
+            else:
+                result = GovernanceOutcome(
+                    asset=update.asset,
+                    governance_version=snapshot.governance_version,
+                    owner=snapshot.owner,
+                    tags=sorted(snapshot.tags),
+                    changed=False,
+                    reason="与当前治理信息一致，幂等写入，版本不变",
+                )
             logger.info(
                 "update_governance 判定: asset=%s changed=%s gv=%s owner=%s tags=%s",
                 update.asset,
-                changed,
+                result.changed,
                 result.governance_version,
                 result.owner,
                 result.tags,

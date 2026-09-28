@@ -102,3 +102,56 @@ def evolve_worker(args) -> tuple[str, int | None]:
         return ("conflict", exc.actual_version)
     finally:
         catalog.store.close()
+
+
+def reader_worker(args) -> tuple[str, int, str | None]:
+    """读者进程：在 ``stop_file`` 出现前反复读，校验快照自洽。
+
+    返回 (ok|error, 成功读取次数, 错误描述)。读者只持有共享锁，应当与
+    其他读者完全并行，且始终读到"某一完整版本"的快照。
+    """
+    import os
+    import time
+
+    repo, i, stop_file = args
+    catalog = MetadataCatalog(PersistentStore(repo))
+    count = 0
+    try:
+        BARRIER.wait()
+        deadline = time.time() + 20
+        while not os.path.exists(stop_file) and time.time() < deadline:
+            snap = catalog.get_asset("hot")
+            names = set(snap.fields)
+            coherent = (
+                (names == {"id"} and snap.schema_version == 1)
+                or (
+                    names == {"id", "name"}
+                    and snap.schema_version == 2
+                )
+            )
+            if not coherent:
+                return ("error", count, f"不自洽快照 sv={snap.schema_version} fields={names}")
+            if snap.governance_version not in (0, 1):
+                return ("error", count, f"非法 gv={snap.governance_version}")
+            count += 1
+        return ("ok", count, None)
+    except Exception as exc:  # noqa: BLE001 - 任何异常都要回传给父进程
+        return ("error", count, repr(exc))
+    finally:
+        catalog.store.close()
+
+
+def name_evolve_worker(repo: str) -> None:
+    """独立进程：把 hot 从 sv=1 演进到 sv=2（加 name 字段）。"""
+    catalog = MetadataCatalog(PersistentStore(repo))
+    catalog.register(
+        RegisterRequest(
+            spec=_table(
+                "hot",
+                FieldSpec("id", FieldType.LONG, False),
+                FieldSpec("name", FieldType.STRING),
+            ),
+            expected_schema_version=1,
+        )
+    )
+    catalog.store.close()

@@ -94,6 +94,48 @@ class AssetSnapshot:
     def field_specs(self) -> dict[str, FieldSpec]:
         return {name: record.spec for name, record in self.fields.items()}
 
+    def copy(self) -> "AssetSnapshot":
+        """深拷贝快照（dict/set 都是可变容器，必须独立复制）。
+
+        存储层在返回快照给调用方时统一走这里，保证调用方拿到的对象与
+        仓库内部持有的对象互不共享可变状态。
+        """
+        return AssetSnapshot(
+            name=self.name,
+            asset_type=self.asset_type,
+            description=self.description,
+            schema_version=self.schema_version,
+            fields=dict(self.fields),
+            owner=self.owner,
+            tags=set(self.tags),
+            governance_version=self.governance_version,
+            created_at=self.created_at,
+            updated_at=self.updated_at,
+        )
+
+    def with_updates(self, **changes) -> "AssetSnapshot":
+        """基于当前快照构造一份新快照（写时复制）。
+
+        ``fields`` / ``tags`` 以外的字段按关键字覆盖；fields、tags 即便
+        内容相同也复制成新容器。任何写入路径都必须通过本方法得到"下一
+        状态"，不允许原地修改当前快照——这样写入失败（甚至尚未落盘）时，
+        仓库内与读者持有的旧快照都不会被污染。
+        """
+        data = {
+            "name": self.name,
+            "asset_type": self.asset_type,
+            "description": self.description,
+            "schema_version": self.schema_version,
+            "fields": dict(self.fields),
+            "owner": self.owner,
+            "tags": set(self.tags),
+            "governance_version": self.governance_version,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+        data.update(changes)
+        return AssetSnapshot(**data)
+
 
 @dataclass(frozen=True)
 class LineageEdge:

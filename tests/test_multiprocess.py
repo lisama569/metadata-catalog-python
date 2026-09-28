@@ -143,6 +143,57 @@ def test_mp_evolve_only_one_wins(seeded_repo):
     catalog.store.close()
 
 
+def test_mp_concurrent_readers_with_writer_are_coherent(seeded_repo, tmp_path):
+    """多个读者进程持续读的同时，写者进程推进结构与治理版本。
+
+    读者全程不得报错/读到拼花状态；写者结束后所有进程收敛到同一最终状态。
+    """
+    import time
+
+    n_readers = 4
+    ctx = _ctx()
+    stop_file = str(tmp_path / "stop")
+    barrier = ctx.Barrier(n_readers)
+    pool = ctx.Pool(
+        processes=n_readers,
+        initializer=workers.init_worker,
+        initargs=(barrier,),
+    )
+    try:
+        # 读者开跑后启动写者，写者完成后再让读者退出：读者因此覆盖了
+        # 写前/写中/写后三个阶段。
+        ar = pool.map_async(
+            workers.reader_worker,
+            [(seeded_repo, i, stop_file) for i in range(n_readers)],
+        )
+        time.sleep(0.5)
+        p = ctx.Process(target=workers.name_evolve_worker, args=(seeded_repo,))
+        p.start()
+        p.join(timeout=30)
+        assert p.exitcode == 0
+        # 写者落盘后，读者至少再读到一次最终状态，再通知它们退出
+        time.sleep(0.5)
+        with open(stop_file, "w") as fh:
+            fh.write("stop")
+        results = ar.get(timeout=40)
+    finally:
+        pool.close()
+        pool.join()
+
+    statuses = [r[0] for r in results]
+    counts = [r[1] for r in results]
+    errors = [r[2] for r in results if r[0] != "ok"]
+    logger.info("判定依据: 读者状态=%s 各完成读取=%s 错误=%s",
+                statuses, counts, errors)
+    assert statuses == ["ok"] * n_readers
+    assert sum(counts) > 0
+
+    final = MetadataCatalog(PersistentStore(seeded_repo))
+    snap = final.get_asset("hot")
+    assert snap.schema_version == 2 and set(snap.fields) == {"id", "name"}
+    final.store.close()
+
+
 def write_assets_from_other_process(repo: str) -> None:
     """另一个独立进程：登记资产并写血缘，验证已开仓库能增量看到。"""
     catalog = MetadataCatalog(PersistentStore(repo))

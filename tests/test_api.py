@@ -156,3 +156,43 @@ def test_storage_error_maps_to_500(tmp_path, monkeypatch):
     logger.info("判定依据: 损坏文件 status=%s body=%s", r.status_code, r.json())
     assert r.status_code == 500
     assert r.json()["code"] == "storage_corruption"
+
+
+def test_write_storage_failure_is_structured_500(tmp_path, monkeypatch):
+    """写入中途磁盘故障：HTTP 返回带 code 的结构化 500，且失败写不生效。
+
+    覆盖"所有调用都应得到明确成功或可区分冲突/失败，不能变成未分类服务端
+    异常"。
+    """
+    repo = tmp_path / "repo"
+    c1 = TestClient(create_app(repo_dir=str(repo)))
+    assert _register(c1, "orders", [{"name": "id", "field_type": "long"}])
+    monkeypatch.setenv("METADATA_CATALOG_CRASH_AFTER_WRITE", "raise")
+    r = _register(c1, "orders", [
+        {"name": "id", "field_type": "long"},
+        {"name": "name", "field_type": "string"},
+    ])
+    monkeypatch.delenv("METADATA_CATALOG_CRASH_AFTER_WRITE")
+    logger.info("判定依据: 写故障 status=%s body=%s", r.status_code, r.json())
+    assert r.status_code == 500
+    assert r.json()["code"] == "storage_error"
+    # 失败写在同进程后续读中不可见
+    body = c1.get("/assets/orders").json()
+    assert body["schema_version"] == 1
+    assert {f["name"] for f in body["fields"]} == {"id"}
+    # 故障消除后仓库仍可正常服务
+    ok = c1.put(
+        "/assets/orders/governance",
+        json={"expected_governance_version": 0, "owner": "alice"},
+    )
+    assert ok.status_code == 200
+
+
+def test_bad_json_body_is_structured_400(client):
+    """请求体不合法也归类为 validation_error(400)，与领域校验同码。"""
+    r = client.post(
+        "/assets/register",
+        json={"name": "orders", "asset_type": "not_a_type", "fields": []},
+    )
+    assert r.status_code == 400
+    assert r.json()["code"] == "validation_error"

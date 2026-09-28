@@ -10,9 +10,11 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -39,6 +41,8 @@ from .store import LocalStore
 
 #: 服务默认使用的本地仓库目录；可用环境变量覆盖。
 DEFAULT_REPO_DIR = os.environ.get("METADATA_CATALOG_REPO", ".metadata_catalog_repo")
+
+logger = logging.getLogger("metadata_catalog.api")
 
 _HTTP_STATUS = {
     ValidationError.code: 400,
@@ -144,6 +148,39 @@ def create_app(
         else:
             status = _HTTP_STATUS.get(exc.code, 400)
         return JSONResponse(status_code=status, content=body)
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error_handler(
+        _request: Request, exc: RequestValidationError
+    ):
+        # 请求体/查询参数不合法：归类为 validation_error(400)，与领域层的
+        # ValidationError 同码，调用方按 code 即可区分。
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "validation_error",
+                "message": "请求参数不合法",
+                "reasons": [
+                    ".".join(str(p) for p in err.get("loc", []))
+                    + ": "
+                    + str(err.get("msg", ""))
+                    for err in exc.errors()
+                ],
+            },
+        )
+
+    @app.exception_handler(Exception)
+    async def _unexpected_error_handler(_request: Request, exc: Exception):
+        # 最后防线：任何未被归类的异常也必须是带 code 的结构化 500，
+        # 而不是没有业务含义的裸服务端错误。细节进日志，不回显给调用方。
+        logger.exception("未归类的服务端异常: %s", exc)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "code": "internal_error",
+                "message": "服务端发生未归类内部错误，请查看服务日志",
+            },
+        )
 
     @app.get("/")
     def read_root():

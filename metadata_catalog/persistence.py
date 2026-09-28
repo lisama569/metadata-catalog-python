@@ -7,6 +7,8 @@
   不会留下只写了一半的残缺结构；
 * 仓库级互斥通过 ``fcntl.flock`` 实现（读共享/写独占），多个进程打开同一
   仓库目录时，"检查 + 写入"仍然在同一跨进程临界区内完成；
+* 进程内的事务模式与重入深度是**每线程**状态（见 :mod:`metadata_catalog.locking`），
+  flock 描述符则是进程共享资源，配合进程内读写锁做引用计数；
 * 读取维护进程内缓存，只在目录发生变化时才重新扫描并读取被改动的文件，
   仓库涨到上万量级时常规查询不会每次都全量读盘。
 
@@ -33,7 +35,12 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from urllib.parse import quote
 
-from .errors import StorageCorruptionError, UnsupportedStorageFormatError
+from .errors import (
+    StorageCorruptionError,
+    StorageError,
+    UnsupportedStorageFormatError,
+)
+from .locking import EXCLUSIVE, NONE, SHARED, TransactionGate
 from .models import (
     AssetSnapshot,
     AssetType,
@@ -263,96 +270,25 @@ def atomic_write(path: str, data: bytes, *, fsync_dir: bool = True) -> None:
         raise
 
 
-class _ReentrantRWLock:
-    """进程内的可重入读写锁：多读单写，同线程读可重入、写可重入。
-
-    用来保护同一进程内对 flock 锁文件描述符与缓存的并发访问；跨进程的
-    多读单写由 ``fcntl.flock`` 在共享/独占两把"外锁"上提供，本锁只负责
-    进程内线程间。不支持"读锁升级为写锁"（catalog 中也不存在这种用法）。
-    """
-
-    def __init__(self) -> None:
-        self._cond = threading.Condition(threading.Lock())
-        self._readers: dict[int, int] = {}
-        self._writer: int | None = None
-        self._writer_depth = 0
-        self._waiting_writers = 0
-
-    def acquire_read(self) -> None:
-        tid = threading.get_ident()
-        with self._cond:
-            if self._writer == tid:
-                # 写持锁线程重入：写锁已包含读权限，无需额外登记。
-                return
-            if tid in self._readers:
-                # 同线程读锁重入。
-                self._readers[tid] += 1
-                return
-            # 写者优先：有写者在排队时，新到读者排在其后，防止读流饿死写者。
-            while self._writer is not None or self._waiting_writers > 0:
-                self._cond.wait()
-            self._readers[tid] = 1
-
-    def release_read(self) -> None:
-        tid = threading.get_ident()
-        with self._cond:
-            if self._writer == tid:
-                return
-            depth = self._readers.get(tid, 0)
-            if depth <= 1:
-                self._readers.pop(tid, None)
-            else:
-                self._readers[tid] = depth - 1
-            if not self._readers:
-                self._cond.notify_all()
-
-    def acquire_write(self) -> None:
-        tid = threading.get_ident()
-        with self._cond:
-            if self._writer == tid:
-                self._writer_depth += 1
-                return
-            if tid in self._readers:
-                # 读锁升级为写锁会自锁，直接拒绝（调用方属于实现错误）。
-                raise RuntimeError("不支持在读事务内嵌套写事务")
-            self._waiting_writers += 1
-            try:
-                while self._writer is not None or self._readers:
-                    self._cond.wait()
-            finally:
-                self._waiting_writers -= 1
-            self._writer = tid
-            self._writer_depth = 1
-
-    def release_write(self) -> None:
-        tid = threading.get_ident()
-        with self._cond:
-            if self._writer != tid:
-                raise RuntimeError("release_write 由未持写锁的线程调用")
-            self._writer_depth -= 1
-            if self._writer_depth == 0:
-                self._writer = None
-                self._cond.notify_all()
-
-
 class PersistentStore:
     """落盘在本地目录、支持多进程共享的元数据仓库。
 
-    线程模型：
+    线程/进程模型：
 
-    * 进程内用 :class:`_ReentrantRWLock` 实现多读单写；
+    * 进程内用 :class:`~metadata_catalog.locking.TransactionGate` 实现
+      每线程可重入的多读单写（事务模式与嵌套深度按线程隔离）；
     * 跨进程用 ``fcntl.flock`` 在同一 ``lock`` 文件上加共享/排他锁；
-    * 每次进入临界区都会在持锁状态下把磁盘变化增量同步进进程内缓存，
-      因此一个进程提交的写入，另一个进程在下一次临界区一定能读到。
+      flock 与打开文件描述关联、整个进程共享一把，因此配合进程内锁做
+      引用计数：第一个读者加共享锁、最后一个读者释放；写者由进程内
+      写锁保证是"唯一持锁线程"，直接加排他锁；
+    * 每次进入**最外层**临界区都在持 flock 的状态下把磁盘变化增量同步进
+      进程内缓存，因此一个进程提交的写入，另一个进程在下一次临界区一定
+      能读到。
 
     读操作必须在 :meth:`read_transaction`（或 :meth:`transaction`）内调用；
     写操作必须在 :meth:`transaction`（排他）内调用。这与服务层"检查 +
     写入同一临界区"的用法一致。
     """
-
-    _NONE = 0
-    _SHARED = 1
-    _EXCLUSIVE = 2
 
     def __init__(self, repo_dir: str | os.PathLike[str]) -> None:
         self.repo_dir = os.path.abspath(os.fspath(repo_dir))
@@ -361,148 +297,196 @@ class PersistentStore:
         self.lock_path = os.path.join(self.repo_dir, "lock")
         self.format_path = os.path.join(self.repo_dir, "FORMAT")
 
-        os.makedirs(self.assets_dir, exist_ok=True)
-        os.makedirs(self.edges_dir, exist_ok=True)
+        try:
+            os.makedirs(self.assets_dir, exist_ok=True)
+            os.makedirs(self.edges_dir, exist_ok=True)
+        except OSError as exc:
+            raise StorageError(f"无法创建仓库目录: {self.repo_dir}") from exc
 
-        self._rw = _ReentrantRWLock()
         # flock 锁文件描述符（不参与读写，只承载锁）。
-        self._lock_fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-        self._held = self._NONE
-        self._depth = 0
+        try:
+            self._lock_fd = os.open(
+                self.lock_path, os.O_RDWR | os.O_CREAT, 0o644
+            )
+        except OSError as exc:
+            raise StorageError(f"无法创建仓库锁文件: {self.lock_path}") from exc
+
         self._closed = False
+
+        # flock 引用计数：fd 是进程共享资源，多个读线程在同一进程内只加
+        # 一次 LOCK_SH；写者由进程内写锁保证独占唯一。
+        self._flock_guard = threading.Lock()
+        self._flock_shared_count = 0
+
+        self._gate = TransactionGate(
+            on_outer_enter=self._on_outer_enter,
+            on_outer_exit=self._on_outer_exit,
+        )
 
         # 进程内缓存：正式文件名 -> (stat 签名, 反序列化对象)
         self._asset_cache: dict[str, tuple[tuple, AssetSnapshot]] = {}
         self._edge_cache: dict[str, tuple[tuple, LineageEdge]] = {}
-        # 各数据目录最近一次同步时的签名（mtime_ns, ctime_ns）；未变即跳过扫描。
-        self._dir_sigs: dict[str, tuple | None] = {
-            self.assets_dir: None,
-            self.edges_dir: None,
-        }
+        # 各数据目录最近一次同步时的签名（mtime_ns, ctime_ns）。
+        # 配合 _dir_synced 判断是否做过首次同步：从未同步、或签名变化
+        # （含目录曾消失又出现）时都必须重新扫描。
+        self._dir_sigs: dict[str, tuple | None] = {}
+        self._dir_synced: set[str] = set()
+        # 构造期（FORMAT 初始化/临时文件清扫）持锁但不装载数据，避免仓库
+        # 一打开就因单个损坏文件而无法启动；首个业务临界区才首次同步。
+        self._refresh_enabled = False
 
-        self._init_format_file()
-        self._sweep_temp_files()
+        # 仓库首次初始化与残留临时文件清扫都必须在跨进程排他区内完成：
+        # 否则可能与其他进程的首次初始化竞争，或把另一个存活进程正在写的
+        # 临时文件误删掉。这里只初始化 FORMAT、清扫临时文件，不装载数据
+        # （_refresh_enabled=False），首个业务事务进入时才做首次全量同步。
+        init_failed = False
+        try:
+            with self._gate.transaction():
+                self._init_format_file()
+                self._sweep_temp_files()
+        except BaseException:
+            init_failed = True
+            raise
+        finally:
+            self._refresh_enabled = True
+            if init_failed:
+                try:
+                    os.close(self._lock_fd)
+                except OSError:
+                    pass
 
     # ---- 仓库初始化 ----
     def _init_format_file(self) -> None:
+        """初始化/校验 FORMAT 标记。调用时已持跨进程排他锁。"""
         prefix = "metadata-catalog-repo format="
-        for _ in range(2):
+        if os.path.exists(self.format_path):
             try:
                 with open(self.format_path, encoding="utf-8") as fh:
                     first = fh.readline().strip()
-                if not first.startswith(prefix):
-                    raise StorageCorruptionError(
-                        f"FORMAT 标记文件内容无法识别: {self.format_path}"
-                    )
-                try:
-                    version = int(first[len(prefix):])
-                except ValueError as exc:
-                    raise StorageCorruptionError(
-                        f"FORMAT 标记文件中的版本号非法: {self.format_path}"
-                    ) from exc
-                if version != FORMAT_VERSION:
-                    raise UnsupportedStorageFormatError(
-                        f"仓库格式版本 {version} 不受支持（当前仅支持 "
-                        f"v{FORMAT_VERSION}）: {self.repo_dir}",
-                        version=version,
-                        supported=FORMAT_VERSION,
-                    )
-                return
-            except FileNotFoundError:
-                # 与其他进程并发首次初始化时：谁先原子建成谁生效，后来者重读。
-                marker = (
-                    f"metadata-catalog-repo format={FORMAT_VERSION}\n"
-                    "# 本目录是元数据目录的本地持久化仓库；请勿手工改写数据文件。\n"
-                ).encode("utf-8")
-                try:
-                    atomic_write(self.format_path, marker, fsync_dir=True)
-                except OSError:
-                    pass
-        # 极少数并发下两次都没读到，退回一次直接判定（存在则成功，否则报错）。
-        if not os.path.exists(self.format_path):
+            except OSError as exc:
+                raise StorageError(
+                    f"FORMAT 标记文件无法读取: {self.format_path}"
+                ) from exc
+            if not first.startswith(prefix):
+                raise StorageCorruptionError(
+                    f"FORMAT 标记文件内容无法识别: {self.format_path}"
+                )
+            try:
+                version = int(first[len(prefix):])
+            except ValueError as exc:
+                raise StorageCorruptionError(
+                    f"FORMAT 标记文件中的版本号非法: {self.format_path}"
+                ) from exc
+            if version != FORMAT_VERSION:
+                raise UnsupportedStorageFormatError(
+                    f"仓库格式版本 {version} 不受支持（当前仅支持 "
+                    f"v{FORMAT_VERSION}）: {self.repo_dir}",
+                    version=version,
+                    supported=FORMAT_VERSION,
+                )
+            return
+        marker = (
+            f"metadata-catalog-repo format={FORMAT_VERSION}\n"
+            "# 本目录是元数据目录的本地持久化仓库；请勿手工改写数据文件。\n"
+        ).encode("utf-8")
+        try:
+            atomic_write(self.format_path, marker, fsync_dir=True)
+        except OSError as exc:
             raise StorageError(
                 f"仓库 FORMAT 标记初始化失败: {self.format_path}"
-            )
+            ) from exc
 
     def _sweep_temp_files(self) -> None:
         """清理上一次写入中途崩溃可能留下的临时文件。
 
-        临时文件从未参与正式文件名，因此清理它们不影响任何已生效的状态。
-        残留只可能来自"上个进程的未完成写入"，在构造新实例时统一清理。
+        仅在构造仓库且持有跨进程排他锁时调用：此时其他打开同一仓库的
+        进程无法处在写入中途，删除动作不会误伤存活写入。临时文件从未参与
+        正式文件名，清理它们不影响任何已生效的状态。
         """
         for directory in (self.assets_dir, self.edges_dir):
             try:
                 names = os.listdir(directory)
             except FileNotFoundError:
                 continue
+            except OSError as exc:
+                raise StorageError(f"仓库目录无法读取: {directory}") from exc
             for name in names:
                 if name.startswith(_TMP_PREFIX):
                     try:
                         os.unlink(os.path.join(directory, name))
                     except FileNotFoundError:
                         pass
+                    except OSError as exc:
+                        raise StorageError(
+                            f"残留临时文件无法清理: {os.path.join(directory, name)}"
+                        ) from exc
 
-    # ---- 跨进程临界区 ----
+    # ---- 跨进程临界区（flock 引用计数） ----
     @contextmanager
     def transaction(self) -> Iterator[None]:
         """排他临界区：进程内其他线程、其他进程都被挡在外面。可重入。"""
-        self._enter(self._EXCLUSIVE)
-        try:
+        if self._closed:
+            raise StorageError("仓库已关闭，不能再开启事务")
+        with self._gate.transaction():
             yield
-        finally:
-            self._leave()
 
     @contextmanager
     def read_transaction(self) -> Iterator[None]:
         """共享临界区：允许多个读者并发，但排斥任何写者。可重入。"""
-        self._enter(self._SHARED)
-        try:
-            yield
-        finally:
-            self._leave()
-
-    def _enter(self, mode: int) -> None:
         if self._closed:
             raise StorageError("仓库已关闭，不能再开启事务")
-        if self._held != self._NONE:
-            if self._held == self._SHARED and mode == self._EXCLUSIVE:
-                raise RuntimeError("不支持在读事务内嵌套写事务")
-            # 同模式或写内重入：直接嵌套，flock 以最外层持有的锁为准。
-            self._depth += 1
-            return
-        if mode == self._EXCLUSIVE:
-            self._rw.acquire_write()
-            fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
-        else:
-            self._rw.acquire_read()
-            fcntl.flock(self._lock_fd, fcntl.LOCK_SH)
-        self._held = mode
-        self._depth = 1
-        try:
-            self._refresh_locked()
-        except BaseException:
-            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-            self._held = self._NONE
-            self._depth = 0
-            if mode == self._EXCLUSIVE:
-                self._rw.release_write()
+        with self._gate.read_transaction():
+            yield
+
+    def _on_outer_enter(self, mode: int) -> None:
+        """拿到进程内锁后、事务生效前：挂 flock 并增量同步缓存。
+
+        flock 与打开文件描述关联、由整个进程共享，它本身不是按线程计数
+        的可重入锁：同一 fd 上若一个线程已持有 LOCK_SH，另一个线程再发
+        LOCK_SH 会被内核当作"锁型转换竞争"而可能阻塞。因此所有 flock
+        获取/释放都必须在 ``_flock_guard`` 内串行，保证每种锁型在本进程
+        内只被真正获取一次，配合计数在用完时释放：
+
+        * 共享：计数 0->1 的线程负责 LOCK_SH，其余线程只增计数
+          （此时该线程已在进程内读锁保护下，且其他读者与其共享同一把
+          跨进程共享锁，语义正确）；
+        * 排他：进程内写锁已保证本进程没有任何读者/写者，直接 LOCK_EX。
+
+        这同时消除了"线程 A 持 SH 阻塞在 EX 上、线程 B 又在等 A"这类
+        同进程自锁。
+        """
+        with self._flock_guard:
+            if mode == EXCLUSIVE:
+                # 进程内写锁已保证此刻本进程没有其他读者/写者。
+                fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
             else:
-                self._rw.release_read()
+                if self._flock_shared_count == 0:
+                    fcntl.flock(self._lock_fd, fcntl.LOCK_SH)
+                self._flock_shared_count += 1
+        try:
+            if self._refresh_enabled:
+                self._refresh_locked()
+        except BaseException:
+            with self._flock_guard:
+                if mode == EXCLUSIVE:
+                    fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                else:
+                    self._flock_shared_count -= 1
+                    if self._flock_shared_count == 0:
+                        fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
             raise
 
-    def _leave(self) -> None:
-        self._depth -= 1
-        if self._depth > 0:
-            return
-        fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-        mode = self._held
-        self._held = self._NONE
-        if mode == self._EXCLUSIVE:
-            self._rw.release_write()
-        else:
-            self._rw.release_read()
+    def _on_outer_exit(self, mode: int) -> None:
+        """最外层事务释放时：解 flock（计数归零才真正解锁）。"""
+        with self._flock_guard:
+            if mode == EXCLUSIVE:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            else:
+                self._flock_shared_count -= 1
+                if self._flock_shared_count == 0:
+                    fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
 
-    # ---- 磁盘 -> 缓存的增量同步（调用时已持外锁） ----
+    # ---- 磁盘 -> 缓存的增量同步（调用时已持 flock 与进程内锁） ----
     @staticmethod
     def _file_sig(path: str) -> tuple | None:
         try:
@@ -525,16 +509,27 @@ class PersistentStore:
 
     def _refresh_dir(self, directory, cache, deserializer) -> None:
         current = self._dir_sig(directory)
-        if current is not None and current == self._dir_sigs.get(directory):
-            # 目录签名未变 -> 目录项没有增删改，缓存无需重新扫描。
+        if (
+            directory in self._dir_synced
+            and current is not None
+            and current == self._dir_sigs.get(directory)
+        ):
+            # 已做过首次同步且目录签名未变 -> 目录项没有增删改，跳过扫描。
             return
+        # 先在新字典里完成全部读盘与反序列化，再整体替换缓存内容：
+        # 即便与同进程其他读者的边界处理有疏漏，也不会让任何线程迭代到
+        # 一张正在被增量改写的表。
+        new_cache = dict(cache)
         try:
             names = os.listdir(directory)
         except FileNotFoundError:
             cache.clear()
-            self._dir_sigs[directory] = None
+            self._dir_sigs[directory] = current
+            self._dir_synced.add(directory)
             return
-        live = set()
+        except OSError as exc:
+            raise StorageError(f"仓库目录无法读取: {directory}") from exc
+        live: set[str] = set()
         for name in names:
             if not name.endswith(".json"):
                 continue
@@ -543,24 +538,40 @@ class PersistentStore:
             sig = self._file_sig(path)
             if sig is None:
                 continue
-            cached = cache.get(name)
+            cached = new_cache.get(name)
             if cached is not None and cached[0] == sig:
                 continue
-            with open(path, "rb") as fh:
-                raw = fh.read()
-            cache[name] = (sig, deserializer(raw, where=path))
-        for gone in list(cache):
+            try:
+                with open(path, "rb") as fh:
+                    raw = fh.read()
+            except OSError as exc:
+                raise StorageError(f"数据文件无法读取: {path}") from exc
+            new_cache[name] = (sig, deserializer(raw, where=path))
+        for gone in list(new_cache):
             if gone not in live:
-                cache.pop(gone, None)
+                new_cache.pop(gone, None)
+        cache.clear()
+        cache.update(new_cache)
         self._dir_sigs[directory] = current
+        self._dir_synced.add(directory)
 
     def _put_asset_locked(self, snapshot: AssetSnapshot) -> None:
         fname = asset_filename(snapshot.name)
         path = os.path.join(self.assets_dir, fname)
-        atomic_write(path, serialize_asset(snapshot))
+        try:
+            atomic_write(path, serialize_asset(snapshot))
+        except OSError as exc:
+            # 磁盘故障归类为可区分的存储错误；注意此处尚未触碰缓存，
+            # 旧快照在进程内与磁盘上都保持完整。
+            if isinstance(exc, StorageError):
+                raise
+            raise StorageError(
+                f"资产快照写入失败，仓库保持写入前状态: {path}"
+            ) from exc
         sig = self._file_sig(path)
         assert sig is not None
-        self._asset_cache[fname] = (sig, snapshot)
+        # 存独立副本：缓存对象不与调用方共享可变引用。
+        self._asset_cache[fname] = (sig, snapshot.copy())
         self._dir_sigs[self.assets_dir] = self._dir_sig(self.assets_dir)
 
     # ---- 资产 ----
@@ -568,7 +579,7 @@ class PersistentStore:
         with self._read_scope():
             entry = self._asset_cache.get(asset_filename(name))
             if entry is not None and entry[1].name == name:
-                return entry[1]
+                return entry[1].copy()
             return None
 
     def put_asset(self, snapshot: AssetSnapshot) -> None:
@@ -577,14 +588,14 @@ class PersistentStore:
 
     def list_assets(self) -> list[AssetSnapshot]:
         with self._read_scope():
-            return [entry[1] for entry in self._asset_cache.values()]
+            return [entry[1].copy() for entry in self._asset_cache.values()]
 
     # ---- 血缘 ----
     def _find_edge(
         self, upstream: str, downstream: str
     ) -> tuple[str, LineageEdge] | None:
         wanted = (upstream, downstream)
-        for fname, (_sig, edge) in self._edge_cache.items():
+        for fname, (_sig, edge) in list(self._edge_cache.items()):
             if (edge.upstream, edge.downstream) == wanted:
                 return fname, edge
         return None
@@ -597,7 +608,14 @@ class PersistentStore:
         with self._write_scope():
             fname = edge_filename(edge)
             path = os.path.join(self.edges_dir, fname)
-            atomic_write(path, serialize_edge(edge))
+            try:
+                atomic_write(path, serialize_edge(edge))
+            except OSError as exc:
+                if isinstance(exc, StorageError):
+                    raise
+                raise StorageError(
+                    f"血缘边写入失败，仓库保持写入前状态: {path}"
+                ) from exc
             sig = self._file_sig(path)
             assert sig is not None
             self._edge_cache[fname] = (sig, edge)
@@ -615,6 +633,8 @@ class PersistentStore:
                 _fsync_dir(self.edges_dir)
             except FileNotFoundError:
                 pass
+            except OSError as exc:
+                raise StorageError(f"血缘边删除失败: {path}") from exc
             self._edge_cache.pop(fname, None)
             self._dir_sigs[self.edges_dir] = self._dir_sig(self.edges_dir)
 
@@ -630,21 +650,39 @@ class PersistentStore:
                 (self.assets_dir, self._asset_cache),
                 (self.edges_dir, self._edge_cache),
             ):
-                for name in os.listdir(directory):
+                try:
+                    names = os.listdir(directory)
+                except FileNotFoundError:
+                    names = []
+                except OSError as exc:
+                    raise StorageError(f"仓库目录无法读取: {directory}") from exc
+                for name in names:
                     if name.endswith(".json") or name.startswith(_TMP_PREFIX):
                         try:
                             os.unlink(os.path.join(directory, name))
                         except FileNotFoundError:
                             pass
-                _fsync_dir(directory)
+                        except OSError as exc:
+                            raise StorageError(
+                                f"仓库文件删除失败: {os.path.join(directory, name)}"
+                            ) from exc
+                try:
+                    _fsync_dir(directory)
+                except OSError as exc:
+                    raise StorageError(f"仓库目录 fsync 失败: {directory}") from exc
                 cache.clear()
                 self._dir_sigs[directory] = self._dir_sig(directory)
 
     def close(self) -> None:
-        """释放锁文件描述符。可重入；关闭后不能再开启事务。"""
+        """释放锁文件描述符。可重入；关闭后不能再开启事务。
+
+        先取一次进程内排他事务，等待其他线程的在途事务结束，避免在它们
+        仍持有 flock 时关闭描述符。
+        """
         if self._closed:
             return
-        self._closed = True
+        with self._gate.transaction():
+            self._closed = True
         try:
             os.close(self._lock_fd)
         except OSError:
@@ -660,7 +698,7 @@ class PersistentStore:
     @contextmanager
     def _read_scope(self) -> Iterator[None]:
         """已在任何临界区内则沿用；否则临时开一个共享临界区。"""
-        if self._held != self._NONE:
+        if self._gate.held_mode() != NONE:
             yield
             return
         with self.read_transaction():
@@ -673,10 +711,11 @@ class PersistentStore:
         否则临时开一个排他临界区。这样公开方法可独立调用，而服务层显式
         事务内的"检查 + 多步写入"仍然共用同一个跨进程临界区。
         """
-        if self._held == self._EXCLUSIVE:
+        mode = self._gate.held_mode()
+        if mode == EXCLUSIVE:
             yield
             return
-        if self._held == self._SHARED:
+        if mode == SHARED:
             raise RuntimeError("写操作不能发生在读事务内")
         with self.transaction():
             yield
