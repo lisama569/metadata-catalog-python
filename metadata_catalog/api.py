@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 from fastapi import FastAPI
@@ -36,6 +37,8 @@ from .models import (
 )
 from .persistence import PersistentStore
 from .store import LocalStore
+
+logger = logging.getLogger("metadata_catalog.api")
 
 #: 服务默认使用的本地仓库目录；可用环境变量覆盖。
 DEFAULT_REPO_DIR = os.environ.get("METADATA_CATALOG_REPO", ".metadata_catalog_repo")
@@ -144,6 +147,25 @@ def create_app(
         else:
             status = _HTTP_STATUS.get(exc.code, 400)
         return JSONResponse(status_code=status, content=body)
+
+    @app.exception_handler(Exception)
+    async def _unexpected_error_handler(_request, exc: Exception):
+        """兜底：任何未被归类的异常也必须是"带 code 的明确失败"。
+
+        存储层已经把磁盘/锁故障包装成 ``StorageError``（走上面的处理器）；
+        到达这里的通常是未预期的服务端缺陷。统一返回
+        ``500 internal_error``，而不是让框架抛出无结构的 500 文本，
+        调用方仍可凭 ``code`` 与业务冲突（409）/业务拒绝（4xx）区分。
+        详情写入服务端日志，不向调用方泄漏内部堆栈。
+        """
+        logger.exception("未分类的服务端异常: %s", exc)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "code": "internal_error",
+                "message": "服务内部错误，本次写入未生效，请重试或联系维护者",
+            },
+        )
 
     @app.get("/")
     def read_root():

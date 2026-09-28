@@ -187,29 +187,80 @@
 还是旧的/残缺的"这类版本与内容对不上的状态。单次写操作具备故障原子性：
 重启后读到的要么是写入前、要么是写入后的完整状态。
 
+#### 失败写在"同一进程"内同样不可见（不仅是重启后）
+
+仅有磁盘原子替换还不够：如果业务层在写盘**之前**就先改写了进程内缓存中的对象，
+那么写盘失败时旧文件虽在磁盘上完好，但同一进程随后的读已经能看到"版本推进、
+字段变化"的半成品；更隐蔽的是，之后一次**无关更新**（如改负责人）会把这份脏
+对象再次整体落盘，使失败的结构在重启后"看起来已经生效"。本实现通过两点杜绝：
+
+- `AssetSnapshot` / `FieldRecord` 是**不可变对象**：任何更新都先在全新容器上
+  组装，再用 `dataclasses.replace` 生成一份**新快照**整体发布，从不就地改写
+  已在缓存中的旧快照；
+- 存储层"先原子写盘成功，再用一份全新缓存 dict 整体替换引用"。写盘抛错时
+  缓存完全不被触碰。
+
+因此一次失败/中断写满足：**失败结构在同一进程的后续读取中不可见，也不会被随后
+一次无关更新带出，重启后同样不可见**；仓库只保留写入前或写入后的完整状态，
+结构版本、字段内容、标签负责人、血缘始终相互对得上。失败期间进程持有的排他锁
+随异常正常释放，后续写可立即继续。
+
 > 说明：这是**单操作级**的原子性（不是跨多资产的事务日志）。批量血缘接口中
 > 先通过的边会独立生效，被拒的边不生效，这与第 3 节既有语义一致。
 
-### 5.3 多进程并发下的保证
+### 5.3 多进程与多线程并发下的保证
 
-跨进程互斥由 `fcntl.flock` 在同一 `lock` 文件上提供（POSIX；Linux/macOS 等），
-进程内另有一把多读单写可重入锁。服务层的"检查 + 写入"始终在同一个跨进程
-临界区内完成，因此多进程下与单进程结论一致：
+同一套结论在三种场景下完全一致：**同一进程内多线程、跨多个 OS 进程、真实 HTTP
+并发**。并发控制分三层，各自堵住一类问题：
 
-- 多个进程并发用相同结构首次登记同一资产：恰好 1 个 `created`，其余
+1. **跨进程**：`fcntl.flock` 在同一 `lock` 文件上提供读共享 / 写独占，服务层的
+   "检查 + 写入"始终在同一个跨进程排他临界区内完成（POSIX；Linux/macOS 等）。
+2. **进程内：线程本地的事务状态与 flock fd**。每个线程独立记录自己持有的锁
+   模式与嵌套深度，并在首次进入临界区时**各自 `open` 一次锁文件、持有自己的
+   fd**。`flock` 锁关联在"打开文件描述"上，独立 fd 让同进程多个读线程对其他
+   进程表现为多把并存的共享锁、写线程则是排他锁——与"多个进程各持一把锁"
+   完全等价，也不会出现一个线程解锁连带释放其他线程锁的问题。同线程事务可
+   重入，嵌套不重复加锁。进程内另用一把多读单写锁保证读者并发、写者独占。
+3. **缓存读多写一**：普通读只在一把短锁内瞬时取一份"此后不再被修改的缓存 dict
+   引用"再遍历，所以读之间完全并发、不会在遍历中撞上字典增删；缓存刷新由刷新
+   闸门串行，并在扫描结束后若发现目录又变化则放弃本次发布，杜绝"旧扫描覆盖新
+   缓存"导致的已提交资产短暂消失。
+
+由此保证：
+
+- **读之间可以同时进行**：多线程/多进程的读彼此并行，且不被慢刷新长时间阻塞；
+  读者只可能读到写入前或写入后的某一份完整快照；
+- **写之间不能互相穿透**：所有写在排他临界区内完成"检查 + 写入"，无 TOCTOU；
+- 多个进程/线程并发用相同结构首次登记同一资产：恰好 1 个 `created`，其余
   `re_registered_idempotent`，最终 `schema_version=1`，**不会重复累加版本**；
-- 多个进程基于同一 `expected_schema_version`/`expected_governance_version`
+- 多个调用方基于同一 `expected_schema_version`/`expected_governance_version`
   并发改同一资产：**恰好 1 个成功，其余全部返回可区分的 `version_conflict`**
   （携带 `expected_version` / `actual_version`），最终版本只 +1，不丢更新、
   不出现字段拼花；
-- 多进程并发写同一条血缘边：恰好 1 个 `accepted`，其余 `duplicate_edge`，
-  磁盘上只保留一份；成环检查同样在排他临界区内，跨进程也不会产生环或重复残留；
-- 任何携带期望版本的写入，只要版本对不上就一定是冲突，**任何情况下都不会被
-  静默当成成功**（HTTP `409`，异常含 expected/actual）。
+- 并发写同一条血缘边：恰好 1 个 `accepted`，其余 `duplicate_edge`，磁盘上只
+  保留一份；成环检查同样在排他临界区内，并发也不会产生环或重复残留；
+- 任何携带过期版本的写入，只要版本对不上就一定是冲突，**任何情况下都不会被
+  静默当成成功**（HTTP `409`，异常含 expected/actual）；
+- 每个调用都得到**明确的成功或可区分的冲突/失败**，不会变成未分类的服务端异常。
 
-**读不阻塞读**：查询走共享锁，多进程/多线程的读彼此完全并行；只有写需要排他
-锁。每次进入临界区时先在锁内增量同步磁盘变化（见 5.4），所以一个进程提交后，
-另一个进程在下一次临界区一定能读到。
+**他进程写入的可见性**：每次进入临界区时先按目录签名增量同步磁盘变化（见 5.4），
+所以一个进程/线程提交后，另一个进程/线程在下一次进入临界区时一定能读到。
+
+### 5.3.1 冲突、业务拒绝与存储失败如何区分
+
+三类否定结果有明确边界，调用方只需按 `code`（HTTP 状态码）分支处理：
+
+| 类别 | code | HTTP | 含义与调用方处理 |
+| --- | --- | --- | --- |
+| 业务冲突 | `version_conflict` | 409 | 携带过期版本的并发写，带 `expected_version`/`actual_version`；读取最新版本后重试 |
+| 业务拒绝 | `validation_error` / `incompatible_schema` / `asset_not_found` / `lineage_cycle` / `duplicate_edge` | 400 / 422 / 404 / 200(血缘结论体) | 输入不合法、演进不兼容、引用缺失、成环、重复边；仓库状态不变 |
+| 存储失败 | `storage_error` / `storage_corruption` / `unsupported_storage_format` | 500 | 磁盘 IO、fsync/flock、数据文件损坏或格式不受支持等仓库侧故障 |
+
+底层文件系统故障（`open`/`write`/`fsync`/`flock` 失败）都会被包装成
+`storage_error`，它**同时是 `OSError` 子类**，因此既保留 `except OSError` 的
+捕获习惯，又带机器可判定的 `code`。HTTP 层另有 `internal_error`(500) 兜底，
+任何未预期异常也返回结构化错误体而不是裸 500 文本。注意：**业务冲突（409）绝不
+是 5xx，存储失败（500）也绝不会被误报成成功或冲突。**
 
 ### 5.4 规模与性能
 
@@ -260,20 +311,25 @@ uv run python -m pytest -s
 | `tests/test_lineage.py` | 接受/重复边/缺失资产/自环/间接成环、批量顺序语义、直接与传递影响范围 |
 | `tests/test_governance.py` | owner/标签增删替换、幂等无变化、乐观锁冲突、冲突后重试、**多线程并发**治理写入、并发同结构登记幂等、并发血缘重复边 |
 | `tests/test_api.py` | HTTP 状态码与错误 `code` 映射、批量接口、404/409/422，以及**重启后 HTTP 读取完整**、损坏文件返回 `500 storage_corruption` |
-| `tests/test_persistence.py` | **磁盘重启完整恢复**、被拒/失败写入不生效、"从未登记 vs 登记后失败"可区分、rename 前抛错/被 kill 不留脏数据与临时文件、FORMAT 版本兼容检查 |
-| `tests/test_multiprocess.py` | **真实多个 OS 进程**（spawn）打开同一仓库：并发治理只一个成功其余冲突、并发登记只一次 created、并发血缘只一份边、并发演进只一次生效且不拼花、他进程写入对已开仓库可见 |
+| `tests/test_persistence.py` | **磁盘重启完整恢复**、被拒/失败写入不生效、"从未登记 vs 登记后失败"可区分、rename 前抛错/被 kill 不留脏数据与临时文件、**失败写后同进程读+无关写再重启仍不可见**、失败边写不可见、FORMAT 版本兼容检查 |
+| `tests/test_concurrency.py` | **同一进程多线程 + 真实 PersistentStore**：并发读+写零异常且快照自洽、同版本并发演进/治理恰一个成功其余可区分冲突、并发登记幂等、并发重复血缘只一份、失败写在同进程后续读与无关写中不可见 |
+| `tests/test_http_concurrency.py` | **真实 uvicorn 进程 + 多线程 httpx**：并发读+写不超时无 5xx、同版本并发演进/治理恰一个 200 其余 409、并发登记与重复血缘的幂等去重 |
+| `tests/test_multiprocess.py` | **真实多个 OS 进程**（spawn）打开同一仓库：并发治理只一个成功其余冲突、并发登记只一次 created、并发血缘只一份边、并发演进只一次生效且不拼花、**多进程×多线程混合读写最终一致（sv==1+成功写数、字段数==sv）**、他进程写入对已开仓库可见 |
 | `tests/test_scale.py` | 10 000 资产 + 5 000 边下暖缓存点查/传递遍历/单笔写入耗时护栏、冷启动装载耗时 |
 
 并发与持久化用例的关键做法：
 
-- 多线程用例使用 `Barrier` 同时发起写入，断言"成功数恰为 1 / 冲突或重复数为
-  N-1 / 最终版本只推进一次"；
+- 多线程用例使用 `Barrier` 同时发起请求，断言"成功数恰为 1 / 冲突或重复数为
+  N-1 / 最终版本只推进一次 / 读者看到的字段数恒等于结构版本"；
+- 真实 HTTP 用例动态选端口拉起独立 `uvicorn` 子进程（默认 PersistentStore），
+  用线程池同时发请求，验证不是 TestClient 同步包装下的"伪并发"；
 - 多进程用例使用 `multiprocessing` 的 **spawn** 上下文拉起独立解释器进程，
-  每个进程独立构造 `PersistentStore`（独立 flock 客户端与独立缓存），这才是
-  "多个服务实例操作同一本地仓库"的真实场景；
+  每个进程独立构造 `PersistentStore`（独立 flock 客户端与独立缓存），混合用例
+  还在每个进程内再起线程，这才是"多个服务实例 + 每实例多 worker"的真实场景；
 - 中断用例通过故障注入点（环境变量 `METADATA_CATALOG_CRASH_AFTER_WRITE`）在
-  "临时文件写完、rename 之前"分别制造抛错与 `os._exit`（模拟被 kill），
-  再重新打开断言状态完整且无残留；
+  "临时文件写完、rename 之前"分别制造抛错（`raise`，归类为 `storage_error`）
+  与 `os._exit`（模拟被 kill），再在同进程读、无关写、重新打开三个视角断言
+  失败内容完全不可见且无临时文件残留；
 - 规模用例只设耗时护栏并打印实测耗时，不绑定具体硬件数字。
 
 ### 6.2 手工验证要点
@@ -291,3 +347,35 @@ uv run python -m pytest -s
 5. **成环**：建立 `a->b->d`，再写 `d->a` 返回 `lineage_cycle`，环不出现在仓库中。
 6. **并发冲突**：两个客户端都基于同一治理版本修改，只有一个 200，另一个 409，
    且响应中带有 `expected_version` 与 `actual_version`。
+7. **失败写不可见（同进程 + 重启）**：
+
+   ```bash
+   # 起服务后先登记 t1（id:long, sv=1），再带故障注入做一次演进：
+   METADATA_CATALOG_CRASH_AFTER_WRITE=raise \
+   METADATA_CATALOG_REPO=./demo_repo uv run python - <<'PY'
+   from metadata_catalog.api import *  # 或直接用 catalog
+   from metadata_catalog.persistence import PersistentStore
+   from metadata_catalog.catalog import MetadataCatalog
+   from metadata_catalog.models import *
+   c = MetadataCatalog(PersistentStore("./demo_repo"))
+   try:
+       c.register(RegisterRequest(spec=AssetSpec(name="t1", asset_type=AssetType.TABLE,
+           fields=[FieldSpec("id", FieldType.LONG, False), FieldSpec("name", FieldType.STRING)]),
+           expected_schema_version=1))
+   except Exception as e:
+       print("归类为", getattr(e, "code", type(e).__name__))   # storage_error
+   print("同进程读:", c.get_asset("t1").schema_version)        # 仍是 1，无 name
+   c.update_governance(GovernanceUpdate(asset="t1", expected_governance_version=0, owner="alice"))
+   c.store.close()
+   PY
+   # 重新打开：sv 仍为 1、字段仍只有 id，而 owner=alice（结构失败未被治理写带出）
+   ```
+
+   把 `raise` 换成 `kill`（`os._exit(42)`，模拟进程在 rename 前被杀）再重新打开，
+   结论相同：sv=1、字段只有 id、无 `.tmp.*` 残留，锁由系统自动释放、可继续写。
+8. **只跑并发/持久化专项**：
+
+   ```bash
+   uv run python -m pytest tests/test_concurrency.py tests/test_http_concurrency.py \
+     tests/test_multiprocess.py tests/test_persistence.py -q
+   ```

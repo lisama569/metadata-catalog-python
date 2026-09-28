@@ -37,8 +37,11 @@ uv run python -m pytest -s
 - `-s` 可看到每个用例打印的**输入**与**判定依据**日志（`register 输入 ...` / `register 判定 ...` 等）。
 - 测试覆盖：重复上报幂等、结构不兼容（类型变更/收紧非空/重命名改类型/资产种类变更）、
   血缘成环/重复边/缺失资产/传递影响、标签与负责人的乐观锁与多线程并发写入；
-  以及持久化专项：**重启完整恢复、写入失败/被 kill 不留脏数据、真实多进程并发
+  以及并发与持久化专项：**同进程多线程真实并发读+写/写+写、真实 uvicorn HTTP
+  并发、失败写在同进程与重启后均不可见（含失败后无关写）、真实多进程×多线程
   最终一致、上万规模读写耗时护栏**（详见 docs 第 6 节）。
+- 只跑并发/持久化专项：
+  `uv run python -m pytest tests/test_concurrency.py tests/test_http_concurrency.py tests/test_multiprocess.py tests/test_persistence.py`
 - 持久化专项用例（真实多进程、上万数据规模）数量少但偏重，可用
   `uv run python -m pytest tests/test_persistence.py tests/test_multiprocess.py`
   只跑这部分。
@@ -65,9 +68,16 @@ uv run python -m pytest -s
 | --- | --- | --- |
 | 400 | `validation_error` | 输入不合法（空名、重复字段、rename 声明矛盾等） |
 | 404 | `asset_not_found` | 引用的资产不存在 |
-| 409 | `version_conflict` | 携带过期版本写入（结构或治理），冲突可区分 |
+| 409 | `version_conflict` | 携带过期版本写入（结构或治理），冲突可区分（含 `expected_version`/`actual_version`） |
 | 422 | `incompatible_schema` | 结构演进不兼容，被拒绝且**不写入** |
-| 500 | `storage_corruption` / `unsupported_storage_format` | 本地仓库数据文件损坏 / 格式版本不受支持（存储故障，区别于业务裁决） |
+| 500 | `storage_error` / `storage_corruption` / `unsupported_storage_format` | 本地仓库磁盘 IO/fsync/flock 故障、数据文件损坏、格式版本不受支持（存储故障，区别于业务裁决；`storage_error` 同时是 `OSError` 子类） |
+| 500 | `internal_error` | 兜底：任何未预期异常也返回带 `code` 的结构化 500，而不是裸 500 文本 |
+
+**冲突（409）≠ 存储失败（500）≠ 成功（200）**：并发写同一版本时其余调用得到
+409 而不是服务端异常；磁盘故障得到 500 `storage_error`，且**失败写在同进程后续
+读取与重启后都完全不可见**，也不会被一次无关更新带出。读之间完全并发，写之间
+全程互斥，同一结论在同进程多线程、跨进程、真实 HTTP 并发下一致。详见
+[`docs/semantics.md`](docs/semantics.md) 第 5 节。
 
 血缘写接口对"重复边/成环/缺失资产"返回 200 且在响应体中用
 `accepted=false` + `code` **明确标记**（业务上可预期、需要逐条处理），而非服务端 5xx。

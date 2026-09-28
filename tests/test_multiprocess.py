@@ -143,6 +143,39 @@ def test_mp_evolve_only_one_wins(seeded_repo):
     catalog.store.close()
 
 
+def test_mp_mixed_threads_final_consistency(seeded_repo):
+    """多个进程 × 每进程多线程，混合并发读 + 追加式写同一资产。
+
+    同时压测进程内读写锁/缓存与跨进程 flock：所有读必须零异常且只看到
+    自洽快照（字段数==结构版本）；写要么成功要么可区分冲突；全部结束后
+    重新打开仓库，最终 sv == 1 + 成功写数，字段数与版本一致，无丢更新。
+    """
+    n = 4
+    logger.info("用例输入: %d 个进程 × 每进程 4 线程混合读写", n)
+    results = _run(workers.mixed_worker, seeded_repo, n)
+    reads = sum(r[0] for r in results)
+    read_err = sum(r[1] for r in results)
+    w_ok = sum(r[2] for r in results)
+    w_conf = sum(r[3] for r in results)
+    logger.info(
+        "判定依据: reads=%d read_errors=%d write_ok=%d write_conflict=%d",
+        reads, read_err, w_ok, w_conf,
+    )
+    assert reads > 0
+    assert read_err == 0
+    assert w_ok >= 1
+    assert w_conf >= 1  # 高并发下必然有冲突方
+
+    catalog = MetadataCatalog(PersistentStore(seeded_repo))
+    snap = catalog.get_asset("hot")
+    logger.info("最终: sv=%s 字段数=%d", snap.schema_version, len(snap.fields))
+    assert snap.schema_version == 1 + w_ok
+    assert len(snap.fields) == snap.schema_version
+    # 每个成功写恰好追加一个唯一字段，不能重复推进版本或丢字段
+    assert "id" in snap.fields
+    catalog.store.close()
+
+
 def write_assets_from_other_process(repo: str) -> None:
     """另一个独立进程：登记资产并写血缘，验证已开仓库能增量看到。"""
     catalog = MetadataCatalog(PersistentStore(repo))

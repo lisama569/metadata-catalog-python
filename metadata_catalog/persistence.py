@@ -7,8 +7,19 @@
   不会留下只写了一半的残缺结构；
 * 仓库级互斥通过 ``fcntl.flock`` 实现（读共享/写独占），多个进程打开同一
   仓库目录时，"检查 + 写入"仍然在同一跨进程临界区内完成；
-* 读取维护进程内缓存，只在目录发生变化时才重新扫描并读取被改动的文件，
-  仓库涨到上万量级时常规查询不会每次都全量读盘。
+* 进程内并发由三层保证：
+
+  - 跨进程 flock 与事务持锁状态都是**线程本地**的：每个线程在首次进入
+    临界区时独立 ``open`` 一次锁文件并持有自己的 fd（独立的"打开文件
+    描述"，flock 语义彼此独立，与多个进程各持一把锁等价），最外层退出
+    时解锁并关闭；同线程事务可重入，嵌套不重复加锁；
+  - 进程内另有多读单写可重入锁，读者之间完全并发、写者排除一切；
+  - 缓存读取只在一把短锁内瞬时取一份"不可变缓存引用"，读之间完全并发；
+    缓存刷新由刷新闸门串行，并对扫描期间又变化的目录放弃发布，杜绝
+    "遍历撞上字典增删"与"旧扫描覆盖新缓存（已提交资产短暂消失）"；
+* 业务对象（``AssetSnapshot``/``FieldRecord``）不可变，每次更新都整体
+  构造并发布新快照，磁盘写失败时已发布的旧快照不被触碰——失败写在同一
+  进程后续读取与重启后都完全不可见，也不会被一次无关更新顺带带出。
 
 文件布局::
 
@@ -33,7 +44,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from urllib.parse import quote
 
-from .errors import StorageCorruptionError, UnsupportedStorageFormatError
+from .errors import (
+    StorageCorruptionError,
+    StorageError,
+    UnsupportedStorageFormatError,
+)
 from .models import (
     AssetSnapshot,
     AssetType,
@@ -223,6 +238,19 @@ def _fsync_dir(path: str) -> None:
         os.close(fd)
 
 
+def _as_storage_error(exc: OSError, where: str) -> StorageError:
+    """把底层文件系统故障统一归类为 ``storage_error``。
+
+    注入故障（``METADATA_CATALOG_CRASH_AFTER_WRITE=raise``）等裸 ``OSError``
+    经此包装后仍可被 ``except OSError`` 捕获（``StorageError`` 同时继承
+    ``OSError``），但带有领域错误码，HTTP 层能映射成结构化的 500，而不是
+    未分类的服务端异常。已属于领域错误的（损坏/格式/注入错误语义）原样保留。
+    """
+    if isinstance(exc, StorageError):
+        return exc
+    return StorageError(f"仓库磁盘操作失败（{where}）: {exc}")
+
+
 def atomic_write(path: str, data: bytes, *, fsync_dir: bool = True) -> None:
     """临时文件 + fsync + 原子 rename 地写入 ``path``。
 
@@ -361,14 +389,23 @@ class PersistentStore:
         self.lock_path = os.path.join(self.repo_dir, "lock")
         self.format_path = os.path.join(self.repo_dir, "FORMAT")
 
-        os.makedirs(self.assets_dir, exist_ok=True)
-        os.makedirs(self.edges_dir, exist_ok=True)
+        try:
+            os.makedirs(self.assets_dir, exist_ok=True)
+            os.makedirs(self.edges_dir, exist_ok=True)
+        except OSError as exc:
+            raise _as_storage_error(exc, f"创建仓库目录 {self.repo_dir}") from exc
 
         self._rw = _ReentrantRWLock()
-        # flock 锁文件描述符（不参与读写，只承载锁）。
-        self._lock_fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-        self._held = self._NONE
-        self._depth = 0
+        # 事务持有状态是**线程本地**的：每个线程独立记录自己是否处于
+        # 临界区、持有哪种锁、嵌套深度，以及自己**专属的 flock 文件描述符**。
+        #
+        # 为什么每个线程要各开一个 lock 文件 fd：fcntl.flock 的锁关联在
+        # "打开文件描述（open file description）"上，同一进程若让多个线程
+        # 共用一个 fd，那么一个线程的 flock(UN) 会连带影响同一 fd 上其他
+        # 线程的锁，无法在"同进程多线程 + 跨进程"下表达独立的共享/排他持有。
+        # 每线程独立 open 即得到独立的打开文件描述，flock 语义随之独立，
+        # 与"多个进程各持一把锁"完全等价。
+        self._local = threading.local()
         self._closed = False
 
         # 进程内缓存：正式文件名 -> (stat 签名, 反序列化对象)
@@ -379,9 +416,27 @@ class PersistentStore:
             self.assets_dir: None,
             self.edges_dir: None,
         }
+        # 缓存刷新（"列目录 + 读改动文件 + 整体换缓存"）专用锁。
+        # 关键点：刷新会在 *共享* 临界区内发生（读者也要同步他进程的写入），
+        # 同一时刻可能有多个线程都持有共享锁；若不加这把锁，两个读者可能
+        # 同时写缓存 dict，而第三个读者正在遍历它 ->
+        # "dictionary changed size during iteration"。刷新串行化后，
+        # 遍历期间只可能读到一个完整的旧/新缓存，读之间仍然并发。
+        self._cache_lock = threading.Lock()
+        # 缓存刷新闸门：把"列目录 + 读改动文件 + 发布"在进程内串行化，
+        # 杜绝多个读者各自刷新导致的缓存回退。它与 _cache_lock 不同——
+        # 普通读只在 _cache_lock 内瞬时取一份缓存引用，不被慢刷新阻塞。
+        self._refresh_gate = threading.Lock()
 
-        self._init_format_file()
-        self._sweep_temp_files()
+        try:
+            self._init_format_file()
+            self._sweep_temp_files()
+        except StorageError:
+            self.close()
+            raise
+        except OSError as exc:
+            self.close()
+            raise _as_storage_error(exc, "初始化仓库目录") from exc
 
     # ---- 仓库初始化 ----
     def _init_format_file(self) -> None:
@@ -461,29 +516,78 @@ class PersistentStore:
         finally:
             self._leave()
 
+    # ---- 跨进程临界区 ----
+    def _thread_state(self) -> tuple[int, int]:
+        """返回当前线程的 (持锁模式, 嵌套深度)；未在事务中为 (NONE, 0)。"""
+        return getattr(self._local, "mode", self._NONE), getattr(
+            self._local, "depth", 0
+        )
+
+    def _open_lock_fd(self) -> int:
+        """当前线程专属的 flock 文件描述符（独立的打开文件描述）。"""
+        try:
+            return os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as exc:
+            raise _as_storage_error(exc, f"打开锁文件 {self.lock_path}")
+
+    @staticmethod
+    def _flock(fd: int, flags: int, where: str) -> None:
+        try:
+            fcntl.flock(fd, flags)
+        except OSError as exc:
+            raise _as_storage_error(exc, where) from exc
+
     def _enter(self, mode: int) -> None:
         if self._closed:
             raise StorageError("仓库已关闭，不能再开启事务")
-        if self._held != self._NONE:
-            if self._held == self._SHARED and mode == self._EXCLUSIVE:
+        held, depth = self._thread_state()
+        if held != self._NONE:
+            if held == self._SHARED and mode == self._EXCLUSIVE:
+                # 读锁升级为写锁会自锁，直接拒绝（调用方属于实现错误）。
                 raise RuntimeError("不支持在读事务内嵌套写事务")
-            # 同模式或写内重入：直接嵌套，flock 以最外层持有的锁为准。
-            self._depth += 1
+            # 同线程内同模式/写内嵌套：直接加深，不重复获取进程锁或 flock。
+            self._local.mode = held
+            self._local.depth = depth + 1
             return
+
+        fd = self._open_lock_fd()
         if mode == self._EXCLUSIVE:
-            self._rw.acquire_write()
-            fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
+            self._rw.acquire_write()  # 进程内：此刻无其他线程持锁
         else:
-            self._rw.acquire_read()
-            fcntl.flock(self._lock_fd, fcntl.LOCK_SH)
-        self._held = mode
-        self._depth = 1
+            self._rw.acquire_read()  # 进程内：允许多个读者并存
+        try:
+            # 每线程独立 fd：这里阻塞等待的是*其他进程*与*本进程其他线程*
+            # 的冲突锁；多读者各自的 SH 彼此兼容。
+            self._flock(
+                fd,
+                fcntl.LOCK_EX if mode == self._EXCLUSIVE else fcntl.LOCK_SH,
+                "获取排他锁" if mode == self._EXCLUSIVE else "获取共享锁",
+            )
+        except BaseException:
+            if mode == self._EXCLUSIVE:
+                self._rw.release_write()
+            else:
+                self._rw.release_read()
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        self._local.mode = mode
+        self._local.depth = 1
+        self._local.fd = fd
         try:
             self._refresh_locked()
         except BaseException:
-            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-            self._held = self._NONE
-            self._depth = 0
+            # 刷新失败：释放本线程的 flock/fd 与进程内锁，状态完全回滚。
+            self._flock(fd, fcntl.LOCK_UN, "释放锁")
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            self._local.mode = self._NONE
+            self._local.depth = 0
+            self._local.fd = None
             if mode == self._EXCLUSIVE:
                 self._rw.release_write()
             else:
@@ -491,13 +595,23 @@ class PersistentStore:
             raise
 
     def _leave(self) -> None:
-        self._depth -= 1
-        if self._depth > 0:
+        held, depth = self._thread_state()
+        if held == self._NONE or depth <= 0:
+            raise RuntimeError("释放事务时当前线程并未持有事务")
+        if depth > 1:
+            self._local.depth = depth - 1
             return
-        fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-        mode = self._held
-        self._held = self._NONE
-        if mode == self._EXCLUSIVE:
+        # 最外层退出：释放本线程专属的 flock 与 fd，再释放进程内锁。
+        fd = self._local.fd
+        self._local.mode = self._NONE
+        self._local.depth = 0
+        self._local.fd = None
+        self._flock(fd, fcntl.LOCK_UN, "释放排他锁" if held == self._EXCLUSIVE else "释放共享锁")
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        if held == self._EXCLUSIVE:
             self._rw.release_write()
         else:
             self._rw.release_read()
@@ -520,53 +634,135 @@ class PersistentStore:
         return (st.st_mtime_ns, st.st_ctime_ns)
 
     def _refresh_locked(self) -> None:
-        self._refresh_dir(self.assets_dir, self._asset_cache, deserialize_asset)
-        self._refresh_dir(self.edges_dir, self._edge_cache, deserialize_edge)
+        self._asset_cache = self._refresh_dir(
+            self.assets_dir, self._asset_cache, deserialize_asset
+        )
+        self._edge_cache = self._refresh_dir(
+            self.edges_dir, self._edge_cache, deserialize_edge
+        )
 
-    def _refresh_dir(self, directory, cache, deserializer) -> None:
-        current = self._dir_sig(directory)
-        if current is not None and current == self._dir_sigs.get(directory):
-            # 目录签名未变 -> 目录项没有增删改，缓存无需重新扫描。
-            return
-        try:
-            names = os.listdir(directory)
-        except FileNotFoundError:
-            cache.clear()
-            self._dir_sigs[directory] = None
-            return
-        live = set()
-        for name in names:
-            if not name.endswith(".json"):
-                continue
-            live.add(name)
-            path = os.path.join(directory, name)
-            sig = self._file_sig(path)
-            if sig is None:
-                continue
-            cached = cache.get(name)
-            if cached is not None and cached[0] == sig:
-                continue
-            with open(path, "rb") as fh:
-                raw = fh.read()
-            cache[name] = (sig, deserializer(raw, where=path))
-        for gone in list(cache):
-            if gone not in live:
-                cache.pop(gone, None)
-        self._dir_sigs[directory] = current
+    def _refresh_dir(self, directory, cache, deserializer) -> dict:
+        """把一个数据目录的磁盘变化增量同步进缓存，返回当前应使用的缓存。
+
+        多个读者线程可同时处于共享临界区，刷新必须防住两类问题：
+
+        * **遍历时改 dict**：发布永远是"整份新 dict 引用替换"，旧 dict
+          一旦发布便不再被修改；读者先在 ``_cache_lock`` 内瞬时取一份缓存
+          引用再在锁外遍历，因此不与刷新争用，普通读也不会被慢扫描阻塞；
+        * **缓存回退（旧扫描覆盖新缓存）**：所有刷新由 ``_refresh_gate``
+          在进程内串行。拿到闸门后再判一次目录签名（等闸门期间可能已被
+          别的线程刷新）；扫描结束后若目录签名又变了（扫描期间磁盘又有新
+          提交），本次结果**不发布**，原样沿用当前缓存，把这次变化留给下
+          一次进入临界区的刷新。这样绝不可能用"基于旧目录算出的缓存"覆盖
+          掉更新的缓存——该缺陷曾让已提交资产在本进程短暂消失。
+        """
+        with self._cache_lock:
+            published_sig = self._dir_sigs.get(directory)
+        disk_sig = self._dir_sig(directory)
+        if disk_sig is not None and disk_sig == published_sig:
+            return cache  # 目录签名未变：无需扫描
+
+        with self._refresh_gate:
+            # double-check：等待闸门期间可能已由别的线程完成刷新。
+            with self._cache_lock:
+                published_sig = self._dir_sigs.get(directory)
+            disk_sig = self._dir_sig(directory)
+            if disk_sig is not None and disk_sig == published_sig:
+                return (
+                    self._asset_cache
+                    if directory == self.assets_dir
+                    else self._edge_cache
+                )
+
+            try:
+                names = os.listdir(directory)
+            except FileNotFoundError:
+                with self._cache_lock:
+                    self._dir_sigs[directory] = None
+                    if directory == self.assets_dir:
+                        self._asset_cache = {}
+                    else:
+                        self._edge_cache = {}
+                    return (
+                        self._asset_cache
+                        if directory == self.assets_dir
+                        else self._edge_cache
+                    )
+
+            with self._cache_lock:
+                base_cache = (
+                    self._asset_cache
+                    if directory == self.assets_dir
+                    else self._edge_cache
+                )
+            new_cache: dict = dict(base_cache)
+            live: set[str] = set()
+            for name in names:
+                if not name.endswith(".json"):
+                    continue
+                live.add(name)
+                path = os.path.join(directory, name)
+                sig = self._file_sig(path)
+                if sig is None:
+                    continue
+                cached = new_cache.get(name)
+                if cached is not None and cached[0] == sig:
+                    continue
+                try:
+                    with open(path, "rb") as fh:
+                        raw = fh.read()
+                except OSError as exc:
+                    raise _as_storage_error(exc, f"读取数据文件 {path}")
+                new_cache[name] = (sig, deserializer(raw, where=path))
+            for gone in [n for n in list(new_cache) if n not in live]:
+                new_cache.pop(gone, None)
+
+            # 扫描期间目录若又发生变化，放弃发布，避免覆盖更新的缓存。
+            final_sig = self._dir_sig(directory)
+            with self._cache_lock:
+                if final_sig != disk_sig:
+                    return (
+                        self._asset_cache
+                        if directory == self.assets_dir
+                        else self._edge_cache
+                    )
+                self._dir_sigs[directory] = final_sig
+                if directory == self.assets_dir:
+                    self._asset_cache = new_cache
+                else:
+                    self._edge_cache = new_cache
+                return new_cache
+
+    def _publish_asset(self, fname: str, sig: tuple, snapshot: AssetSnapshot) -> None:
+        """在缓存锁内整体替换资产缓存引用（旧 dict 冻结）。"""
+        with self._cache_lock:
+            new_cache = dict(self._asset_cache)
+            new_cache[fname] = (sig, snapshot)
+            self._asset_cache = new_cache
+            self._dir_sigs[self.assets_dir] = self._dir_sig(self.assets_dir)
 
     def _put_asset_locked(self, snapshot: AssetSnapshot) -> None:
         fname = asset_filename(snapshot.name)
         path = os.path.join(self.assets_dir, fname)
-        atomic_write(path, serialize_asset(snapshot))
-        sig = self._file_sig(path)
+        try:
+            atomic_write(path, serialize_asset(snapshot))
+            sig = self._file_sig(path)
+        except OSError as exc:
+            # 磁盘写入失败时绝不触碰缓存：已发布的旧快照继续对所有读可见，
+            # 失败写在同进程内与重启后都不可见。
+            raise _as_storage_error(exc, f"写入资产文件 {path}")
         assert sig is not None
-        self._asset_cache[fname] = (sig, snapshot)
-        self._dir_sigs[self.assets_dir] = self._dir_sig(self.assets_dir)
+        self._publish_asset(fname, sig, snapshot)
+
+    def _snapshot_asset_cache(self) -> dict[str, tuple[tuple, AssetSnapshot]]:
+        with self._cache_lock:
+            return self._asset_cache
 
     # ---- 资产 ----
     def get_asset(self, name: str) -> AssetSnapshot | None:
         with self._read_scope():
-            entry = self._asset_cache.get(asset_filename(name))
+            cache = self._snapshot_asset_cache()
+            entry = cache.get(asset_filename(name))
             if entry is not None and entry[1].name == name:
                 return entry[1]
             return None
@@ -577,35 +773,52 @@ class PersistentStore:
 
     def list_assets(self) -> list[AssetSnapshot]:
         with self._read_scope():
-            return [entry[1] for entry in self._asset_cache.values()]
+            # 先取某一版缓存引用（一份此后不再被改写的 dict），再在锁外遍历。
+            cache = self._snapshot_asset_cache()
+            return [entry[1] for entry in cache.values()]
 
     # ---- 血缘 ----
     def _find_edge(
-        self, upstream: str, downstream: str
+        self,
+        cache: dict[str, tuple[tuple, LineageEdge]],
+        upstream: str,
+        downstream: str,
     ) -> tuple[str, LineageEdge] | None:
         wanted = (upstream, downstream)
-        for fname, (_sig, edge) in self._edge_cache.items():
+        for fname, (_sig, edge) in cache.items():
             if (edge.upstream, edge.downstream) == wanted:
                 return fname, edge
         return None
 
+    def _snapshot_edge_cache(self) -> dict[str, tuple[tuple, LineageEdge]]:
+        with self._cache_lock:
+            return self._edge_cache
+
     def has_edge(self, upstream: str, downstream: str) -> bool:
         with self._read_scope():
-            return self._find_edge(upstream, downstream) is not None
+            cache = self._snapshot_edge_cache()
+            return self._find_edge(cache, upstream, downstream) is not None
 
     def add_edge(self, edge: LineageEdge) -> None:
         with self._write_scope():
             fname = edge_filename(edge)
             path = os.path.join(self.edges_dir, fname)
-            atomic_write(path, serialize_edge(edge))
-            sig = self._file_sig(path)
+            try:
+                atomic_write(path, serialize_edge(edge))
+                sig = self._file_sig(path)
+            except OSError as exc:
+                raise _as_storage_error(exc, f"写入血缘文件 {path}")
             assert sig is not None
-            self._edge_cache[fname] = (sig, edge)
-            self._dir_sigs[self.edges_dir] = self._dir_sig(self.edges_dir)
+            with self._cache_lock:
+                new_cache = dict(self._edge_cache)
+                new_cache[fname] = (sig, edge)
+                self._edge_cache = new_cache
+                self._dir_sigs[self.edges_dir] = self._dir_sig(self.edges_dir)
 
     def remove_edge(self, upstream: str, downstream: str) -> None:
         with self._write_scope():
-            found = self._find_edge(upstream, downstream)
+            cache = self._snapshot_edge_cache()
+            found = self._find_edge(cache, upstream, downstream)
             if found is None:
                 return
             fname, _edge = found
@@ -615,40 +828,67 @@ class PersistentStore:
                 _fsync_dir(self.edges_dir)
             except FileNotFoundError:
                 pass
-            self._edge_cache.pop(fname, None)
-            self._dir_sigs[self.edges_dir] = self._dir_sig(self.edges_dir)
+            except OSError as exc:
+                raise _as_storage_error(exc, f"删除血缘文件 {path}")
+            with self._cache_lock:
+                new_cache = {k: v for k, v in self._edge_cache.items() if k != fname}
+                self._edge_cache = new_cache
+                self._dir_sigs[self.edges_dir] = self._dir_sig(self.edges_dir)
 
     def list_edges(self) -> list[LineageEdge]:
         with self._read_scope():
-            return [entry[1] for entry in self._edge_cache.values()]
+            cache = self._snapshot_edge_cache()
+            return [entry[1] for entry in cache.values()]
 
     # ---- 维护 ----
     def reset(self) -> None:
         """清空仓库中全部资产与血缘边（仅供测试/维护使用）。"""
         with self._write_scope():
-            for directory, cache in (
-                (self.assets_dir, self._asset_cache),
-                (self.edges_dir, self._edge_cache),
-            ):
-                for name in os.listdir(directory):
+            for directory in (self.assets_dir, self.edges_dir):
+                try:
+                    names = os.listdir(directory)
+                except FileNotFoundError:
+                    names = []
+                for name in names:
                     if name.endswith(".json") or name.startswith(_TMP_PREFIX):
                         try:
                             os.unlink(os.path.join(directory, name))
                         except FileNotFoundError:
                             pass
-                _fsync_dir(directory)
-                cache.clear()
-                self._dir_sigs[directory] = self._dir_sig(directory)
+                        except OSError as exc:
+                            raise _as_storage_error(
+                                exc, f"清空数据文件 {os.path.join(directory, name)}"
+                            )
+                try:
+                    _fsync_dir(directory)
+                except OSError as exc:
+                    raise _as_storage_error(exc, f"同步目录 {directory}")
+                with self._cache_lock:
+                    if directory == self.assets_dir:
+                        self._asset_cache = {}
+                    else:
+                        self._edge_cache = {}
+                    self._dir_sigs[directory] = self._dir_sig(directory)
 
     def close(self) -> None:
-        """释放锁文件描述符。可重入；关闭后不能再开启事务。"""
+        """标记仓库关闭并释放**当前线程**可能仍持有的锁文件描述符。
+
+        flock fd 是线程本地的，正常用法应先让各线程退出事务；这里仅兜底
+        关闭调用 close 的线程自身的 fd（关闭即自动释放其 flock）。其他线程
+        的 fd 随线程结束/进程退出由操作系统回收。可重入；关闭后不能再开启事务。
+        """
         if self._closed:
             return
         self._closed = True
-        try:
-            os.close(self._lock_fd)
-        except OSError:
-            pass
+        fd = getattr(self._local, "fd", None)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            self._local.fd = None
+            self._local.mode = self._NONE
+            self._local.depth = 0
 
     def __enter__(self) -> "PersistentStore":
         return self
@@ -659,8 +899,9 @@ class PersistentStore:
     # ---- 内部约束 ----
     @contextmanager
     def _read_scope(self) -> Iterator[None]:
-        """已在任何临界区内则沿用；否则临时开一个共享临界区。"""
-        if self._held != self._NONE:
+        """已在任何临界区内则沿用当前线程已持有的锁；否则临时开共享临界区。"""
+        held, _depth = self._thread_state()
+        if held != self._NONE:
             yield
             return
         with self.read_transaction():
@@ -668,15 +909,15 @@ class PersistentStore:
 
     @contextmanager
     def _write_scope(self) -> Iterator[None]:
-        """已在排他临界区内则沿用；在共享临界区内属于实现错误；
-
+        """当前线程已在排他临界区内则沿用；在读临界区内属于实现错误；
         否则临时开一个排他临界区。这样公开方法可独立调用，而服务层显式
         事务内的"检查 + 多步写入"仍然共用同一个跨进程临界区。
         """
-        if self._held == self._EXCLUSIVE:
+        held, _depth = self._thread_state()
+        if held == self._EXCLUSIVE:
             yield
             return
-        if self._held == self._SHARED:
+        if held == self._SHARED:
             raise RuntimeError("写操作不能发生在读事务内")
         with self.transaction():
             yield

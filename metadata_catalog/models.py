@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 
@@ -68,17 +68,26 @@ class RegisterRequest:
     expected_schema_version: int | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class FieldRecord:
-    """已登记字段在仓库中的记录（携带首次登记版本）。"""
+    """已登记字段在仓库中的记录（携带首次登记版本）。
+
+    不可变：结构演进时整体构造新记录，绝不就地改写。
+    """
 
     spec: FieldSpec
     since_version: int = 1
 
 
-@dataclass
+@dataclass(frozen=True)
 class AssetSnapshot:
-    """资产在仓库中的当前完整快照。"""
+    """资产在仓库中的当前完整快照。
+
+    不可变：任何更新都通过 :func:`dataclasses.replace` 生成并整体发布新
+    快照。这样"写入中途失败"不会把半成品留在仓库缓存里，也避免不同线程
+    同时看到一个正在被改写的对象。``tags``/``fields`` 均为新构造的容器，
+    发布后不再被任何一方修改。
+    """
 
     name: str
     asset_type: AssetType

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Protocol
 
 from .errors import (
@@ -326,9 +327,15 @@ class MetadataCatalog:
             }
             if not changes and structural == old_structural:
                 # 描述等非结构信息允许刷新，但结构版本不动，结论幂等。
-                existing.description = spec.description
-                existing.updated_at = now_ts()
-                self.store.put_asset(existing)
+                # 构造全新快照发布，绝不就地改写已在缓存中的旧快照——
+                # 否则一旦后续 put_asset 因磁盘故障失败，"刷新后的描述"
+                # 也会作为未提交内容残留在同进程读取中。
+                refreshed = replace(
+                    existing,
+                    description=spec.description,
+                    updated_at=now_ts(),
+                )
+                self.store.put_asset(refreshed)
                 logger.info(
                     "register 判定: idempotent asset=%s schema_version=%s",
                     spec.name,
@@ -343,6 +350,9 @@ class MetadataCatalog:
                 )
 
             # ---- 兼容演进：构造下一个版本 ----
+            # 全程不修改 existing：先在全新的 fields 容器上组装，最后整体
+            # replace 出一份新快照再发布。put_asset 若失败（磁盘错误/进程
+            # 被杀），已发布的 existing 仍是写入前的完整状态。
             next_version = existing.schema_version + 1
             rename_targets = {v: k for k, v in request.renames.items()}
             next_fields: dict[str, FieldRecord] = {}
@@ -361,11 +371,14 @@ class MetadataCatalog:
                         spec=f, since_version=next_version
                     )
 
-            existing.fields = next_fields
-            existing.schema_version = next_version
-            existing.description = spec.description
-            existing.updated_at = now_ts()
-            self.store.put_asset(existing)
+            updated = replace(
+                existing,
+                fields=next_fields,
+                schema_version=next_version,
+                description=spec.description,
+                updated_at=now_ts(),
+            )
+            self.store.put_asset(updated)
             logger.info(
                 "register 判定: evolved asset=%s schema_version=%s changes=%s",
                 spec.name,
@@ -615,11 +628,17 @@ class MetadataCatalog:
             changed = owner_changed or tags_changed
 
             if changed:
-                snapshot.owner = new_owner
-                snapshot.tags = new_tags
-                snapshot.governance_version += 1
-                snapshot.updated_at = now_ts()
-                self.store.put_asset(snapshot)
+                # 同样是 copy-on-write：新标签集合与新版本号只存在于新快照
+                # 上，put_asset 成功前旧快照保持完整可见。
+                updated = replace(
+                    snapshot,
+                    owner=new_owner,
+                    tags=new_tags,
+                    governance_version=snapshot.governance_version + 1,
+                    updated_at=now_ts(),
+                )
+                self.store.put_asset(updated)
+                snapshot = updated
 
             result = GovernanceOutcome(
                 asset=update.asset,

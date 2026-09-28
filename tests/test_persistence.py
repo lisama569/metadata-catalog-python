@@ -311,3 +311,92 @@ def test_format_file_compatibility_is_checked(tmp_path):
     marker.write_text("garbage\n", encoding="utf-8")
     with pytest.raises(StorageCorruptionError):
         PersistentStore(repo)
+
+
+def test_failed_write_then_unrelated_write_then_restart(tmp_path, monkeypatch):
+    """失败的结构演进不能被随后一次无关更新带出，重启后同样不可见。
+
+    这是"失败资产结构在之后一次无关更新中被带出，重启后像已生效"的
+    专项回归：失败写后先做一次无关治理写（会再次原子落盘），随后在
+    *同一进程* 与 *重新打开* 两个视角都断言结构停留在写入前，而治理
+    信息是新值——结构版本、字段、标签、负责人彼此对得上。
+    """
+    repo = tmp_path / "repo"
+    c1 = _open(repo)
+    c1.register(RegisterRequest(spec=_table(
+        "t1", FieldSpec("id", FieldType.LONG, False))))
+
+    monkeypatch.setenv("METADATA_CATALOG_CRASH_AFTER_WRITE", "raise")
+    from metadata_catalog.errors import StorageError
+
+    with pytest.raises(StorageError):
+        c1.register(RegisterRequest(spec=_table(
+            "t1",
+            FieldSpec("id", FieldType.LONG, False),
+            FieldSpec("name", FieldType.STRING),
+        ), expected_schema_version=1))
+    monkeypatch.delenv("METADATA_CATALOG_CRASH_AFTER_WRITE")
+
+    # 同进程立即读：失败结构不可见
+    s0 = c1.get_asset("t1")
+    assert s0.schema_version == 1 and set(s0.fields) == {"id"}
+
+    # 一次与结构无关的治理写（触发又一次原子落盘）
+    gov = c1.update_governance(
+        GovernanceUpdate(
+            asset="t1", expected_governance_version=0,
+            owner="alice", add_tags=frozenset({"pii"}),
+        )
+    )
+    assert gov.changed and gov.governance_version == 1
+
+    # 同进程：结构仍是旧的、治理是新的，二者不得串台
+    s1 = c1.get_asset("t1")
+    assert s1.schema_version == 1 and set(s1.fields) == {"id"}
+    assert s1.governance_version == 1
+    assert s1.owner == "alice" and s1.tags == {"pii"}
+    c1.store.close()
+
+    # 重启后：失败的结构演进依然完全不可见
+    c2 = _open(repo)
+    s2 = c2.get_asset("t1")
+    logger.info("判定依据: 重启后 sv=%s fields=%s gv=%s owner=%s tags=%s",
+                s2.schema_version, sorted(s2.fields),
+                s2.governance_version, s2.owner, sorted(s2.tags))
+    assert s2.schema_version == 1
+    assert set(s2.fields) == {"id"}
+    assert s2.fields["id"].spec.field_type is FieldType.LONG
+    assert s2.governance_version == 1
+    assert s2.owner == "alice" and s2.tags == {"pii"}
+    # 临时文件无残留
+    assert not list((repo / "assets").glob(".tmp.*"))
+    c2.store.close()
+
+
+def test_failed_edge_write_not_visible(tmp_path, monkeypatch):
+    """血缘边文件写入失败时：该边在同进程和重启后都不可见，其余边不受影响。"""
+    repo = tmp_path / "repo"
+    c1 = _open(repo)
+    c1.register(RegisterRequest(spec=_table("a")))
+    c1.register(RegisterRequest(spec=_table("b")))
+    c1.register(RegisterRequest(spec=_table("c")))
+    assert c1.add_lineage(LineageEdge("a", "b")).accepted
+
+    monkeypatch.setenv("METADATA_CATALOG_CRASH_AFTER_WRITE", "raise")
+    with pytest.raises(OSError):
+        c1.add_lineage(LineageEdge("b", "c"))
+    monkeypatch.delenv("METADATA_CATALOG_CRASH_AFTER_WRITE")
+
+    # 同进程：失败边不可见，旧边仍在
+    assert len(c1.store.list_edges()) == 1
+    assert not c1.store.has_edge("b", "c")
+    assert c1.store.has_edge("a", "b")
+    # 之后正常补写成功（锁/缓存未被失败写破坏）
+    assert c1.add_lineage(LineageEdge("b", "c")).accepted
+    c1.store.close()
+
+    c2 = _open(repo)
+    assert len(c2.store.list_edges()) == 2
+    assert c2.store.has_edge("b", "c")
+    assert not list((repo / "edges").glob(".tmp.*"))
+    c2.store.close()
